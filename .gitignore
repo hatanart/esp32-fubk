@@ -1,0 +1,20 @@
+# build output
+esp32/firmware/build/
+esp32/firmware/sdkconfig
+esp32/firmware/sdkconfig.old
+esp32/firmware/managed_components/
+esp32/firmware/dependencies.lock
+
+# generated test data and host binaries
+esp32/out/
+ref/out/
+esp32/host/host_*
+esp32/host/host20_*
+!esp32/host/host_test.c
+!esp32/host/host20_test.c
+
+# python
+venv/
+__pycache__/
+*.pyc
+
