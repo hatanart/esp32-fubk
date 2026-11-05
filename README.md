@@ -1,5 +1,11 @@
 # ESP32 FuBK / SMPTE test pattern generator
 
+<p align="center">
+  <img src="docs/fubk-pal-crt.jpg" width="49%" alt="FuBK test card in PAL on a Panasonic CRT TV">
+  <img src="docs/smpte-ntsc-crt.jpg" width="49%" alt="SMPTE colour bars in NTSC on a Panasonic CRT TV">
+</p>
+<p align="center"><em>PAL FuBK (left) and NTSC SMPTE bars (right) from the ESP32, on a Panasonic CRT.</em></p>
+
 Composite video test patterns from a plain ESP32 and one resistor:
 
 - **PAL:** the German **FuBK** test card (Funkbetriebskommission). It is built from the original
