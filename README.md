@@ -13,7 +13,9 @@ Composite video test patterns from a plain ESP32 and one resistor:
   gratings, anti-PAL boxes and the 4.43 MHz orange patch are real.
 - **NTSC:** **SMPTE EG-1 colour bars**, with castellations, −I / white / +Q, and PLUGE.
 
-One button switches between them, and two LEDs show which one is on. A 1 kHz test tone, locked
+One button switches between them, and two LEDs show which one is on. A second button steps
+through 13 everyday calibration patterns: crosshatch, dots, circles, colour bars, greyscale with
+PLUGE, purity fields, multiburst, overscan markers and a white window. A 1 kHz test tone, locked
 to the picture, comes out on another pin.
 
 The ESP32's internal 8-bit DAC sends samples at 20 MS/s. The colour subcarrier is calculated
@@ -42,8 +44,11 @@ revisions (rev 0) also work, because the clock uses integer PLL settings only.
               |                 GND o----------------------------o  shield
               |                     |                       (TV: 75R to GND inside)
               |                     |
-              |                     |     push button
+              |                     |   PAL/NTSC button
               |      GPIO4  ("D4")  o-------o  o------+
+              |                     |                 |
+              |                     |   pattern button|
+              |      GPIO15 ("D15") o-------o  o------+
               |                     |                 |
               |                     |   330R    PAL   |
               |      GPIO12         o--/\/\/\---|>|---+
@@ -67,6 +72,7 @@ revisions (rev 0) also work, because the clock uses integer PLL settings only.
 |---|---|
 | GPIO25 (DAC1) | Composite video. Use a **110 Ω series resistor** into the TV's 75 Ω (see below). |
 | GPIO4 | Push button to GND (internal pull-up). Toggles PAL / NTSC; the choice is saved in flash and the board restarts. |
+| GPIO15 | Push button to GND (internal pull-up). Next pattern; see [Use](#use). Not saved. GPIO15 is a strapping pin, but holding it at reset only silences the boot messages. |
 | GPIO12 | LED: on in PAL. **Wire it as LED + resistor to GND** (the pin drives it high). GPIO12 is a strapping pin: anything that pulls it high at reset sets the wrong flash voltage and the board won't boot. |
 | GPIO13 | LED: on in NTSC (LED + resistor to GND). |
 | GPIO18 | 1 kHz sine as 312.5 kHz PWM. Filter it with an RC low-pass (3.3 kΩ + 10 nF) and a coupling capacitor. |
@@ -136,8 +142,146 @@ Average load is roughly 40 to 60 % per core.
 ## Use
 
 Power the board and connect the video output to the TV. It starts in the standard it last used
-(PAL the first time). Press the button to switch; the board restarts in the other standard
-within a second.
+(PAL the first time). Press the PAL/NTSC button to switch; the board restarts in the other
+standard within a second.
+
+It always starts with the real test card: FuBK in PAL, SMPTE bars in NTSC. The pattern button
+steps through the patterns below and back to the test card. The switch happens at a frame
+start, so the TV keeps its sync. Between two extra patterns the screen is black for a few frames
+while the next one is copied into RAM. The choice is not saved: after power-off it is the test card
+again.
+
+![The 13 extra patterns](docs/patterns.png)
+
+*The extra patterns as rendered from the pattern data (ideal pictures, not photos of a TV). PAL
+and NTSC look the same; they differ in black level, PLUGE levels and multiburst frequencies.*
+
+| # | Pattern | Use it for |
+|---|---|---|
+| 0 | FuBK (PAL) / SMPTE EG-1 bars (NTSC) | overall check, the reference |
+| 1 | Crosshatch, 16 × 12 square cells, white on black | geometry, linearity, convergence. The middle lines are the centre cross; the outermost lines sit at the picture edge, so they show how much the TV crops. |
+| 2 | Dots at the crosshatch crossings | static convergence, focus |
+| 3 | Grey crosshatch with a large circle and four corner circles | linearity, aspect ratio (circles must be round) |
+| 4 | Full-field colour bars 100/0/75/0 (white 100 %, colours 75 %) | colour, tint, decoder check |
+| 5 | 11 grey steps (0–100 %) above PLUGE (PAL −2 % / +2 %, NTSC 3.5 / 11.5 IRE) and a white patch | brightness, contrast, greyscale tracking |
+| 6–9 | White, red, green, blue fields (100 %) | purity, white balance, weak guns |
+| 10 | Black field | brightness, raster glow, hum bars |
+| 11 | Multiburst: white flag, then 60 % p-p bursts (PAL 0.5, 1, 2, 4, 4.8, 5.8 MHz; NTSC 0.5, 1.25, 2, 3, 3.58, 4.1 MHz) | sharpness, bandwidth, luma/chroma separation |
+| 12 | Overscan markers: picture edge (white), 5 % action safe (75 % grey), 10 % title safe (50 % grey), centre cross | overscan, centring |
+| 13 | White window, half width and height | high-voltage regulation, blooming, smearing |
+
+All lines are white or grey, never thin coloured lines: composite colour only has about 1.3 MHz
+of bandwidth, so thin red or blue lines smear. Horizontal lines are 2 picture lines thick (one in
+each field), so they don't flicker on interlaced TVs. The list order is fixed: new patterns are
+added at the end, so a number always means the same pattern.
+
+### What you should see
+
+Set up a CRT in this order: brightness and contrast first (patterns 5 and 10), then colour
+(0 and 4), then geometry, convergence and focus (1, 2 and 3). Let the set warm up for
+15–30 minutes before fine adjustments. Scalers and flat screens usually have no knobs. For them,
+the patterns show what the device does with the signal.
+
+**0 – FuBK (PAL)**
+- The big circle is round, and the grid squares are equal.
+- The gratings in the middle (1, 2 and 3 MHz) look like even vertical lines, not grey. The finest
+  one shows the set's sharpness.
+- The colour bars at the top have clean edges and no colour fringes around the grey areas.
+- **Anti-PAL boxes** (the two boxes at the lower right, next to the colour ramps): their colour
+  flips from line to line. A TV with a PAL delay line averages that away and shows them calm and
+  nearly grey. A simple PAL decoder without one shows strong colour or horizontal stripes. That
+  tells you which kind of decoder the set has, and it is not a fault.
+
+**0 – SMPTE bars (NTSC)**
+- Top: 75 % bars, in the order white, yellow, cyan, green, magenta, red, blue.
+- Middle: a thin row of "castellations" with the bars in reverse order.
+- Bottom: −I, white, +Q and black, then PLUGE at the bottom right.
+- **Colour and tint:** if the set has a blue-only mode (or you look through a blue filter), adjust
+  colour and tint until each blue bar matches the castellation just below it.
+
+**5 – Greyscale and PLUGE**
+
+```
+ +----+----+----+----+----+----+----+----+----+----+----+
+ | 0% |10% |20% |    ...                     |90% |100%|   11 grey steps
+ |    |    |    |                            |    |    |
+ +------+------+------+------+------+------+------------+
+ |black | dark |black |bright|black |white |   black    |   PLUGE band
+ |      | bar  |      | bar  |      |patch |            |
+ +------+------+------+------+------+------+------------+
+          PAL  -2 %     +2 %
+          NTSC 3.5 IRE  11.5 IRE   (black is 7.5 IRE)
+```
+
+- **Brightness:** the dark bar is "blacker than black", the bright bar is just above black. Turn
+  brightness up until you see both bars, then down until the **dark bar just disappears** into
+  the black while the **bright bar stays faintly visible**. That is correct black level.
+- **Contrast:** set it so the white patch and the 100 % step are bright but don't bloom (grow or
+  go soft at the edges). All 11 grey steps should be distinct, including 0 % vs 10 % and 90 % vs
+  100 %.
+- **Greyscale tracking:** every step should be the same neutral grey. A coloured tint only in the
+  dark steps points to the cut-off (bias) settings, and only in the bright steps to the drive
+  (gain) settings.
+- **On a scaler or flat screen:** most clip everything below black, so the dark bar never shows,
+  which is normal. In NTSC many devices expect black at 0 IRE (Japan) instead of 7.5 IRE (USA).
+  Then the black areas look dark grey and both bars show easily.
+- **The PAL bars are faint on purpose:** ±2 % is 14 mV. The NTSC bars are twice as far from black
+  (±4 IRE).
+
+**1 – Crosshatch**
+- All lines straight, and every cell the same size and square. Smaller cells at one side mean
+  linearity is off.
+- The centre cross (the middle vertical and horizontal line) sits in the middle of the tube.
+- The outermost lines are the edge of the picture. On a CRT, they normally fall just outside the
+  visible area (overscan).
+- **Convergence:** the lines are pure white. Red, green or blue fringes beside a line mean the
+  three beams don't meet there.
+
+**2 – Dots**
+- **Focus:** small, round, sharp dots, equally sharp in the centre and the corners.
+- **Static convergence:** each dot is white in the centre of the screen, not three coloured dots
+  side by side.
+
+**3 – Circles**
+- The large circle is round, not oval. If it is oval, the width or height is off.
+- The four corner circles are round and all the same size; if not, linearity at the edges is off.
+
+**4 – Colour bars 100/0/75/0**
+- Order: white, yellow, cyan, green, magenta, red, blue, black.
+- Turn colour down to zero: you should see an even staircase from bright to dark.
+- In blue-only mode: cyan, magenta and blue look equally bright (white is brighter, because it is
+  100 %). If they differ, adjust colour (saturation) and tint.
+
+**6–9 – White, red, green and blue fields**
+- **Purity:** each field is one even colour all over. Coloured blotches, usually near the corners,
+  mean the tube needs degaussing or purity adjustment.
+- **White:** the same neutral white everywhere, with no tint towards one side.
+
+**10 – Black field**
+- At correct brightness, the screen is black with no visible raster.
+- Look for hum bars (slow-moving dark or light bands), retrace lines, and a glow at the edges.
+
+**11 – Multiburst**
+- Left: a white reference flag. Then six bursts of vertical stripes, from coarse to fine
+  (PAL: 0.5, 1, 2, 4, 4.8, 5.8 MHz).
+- **Sharpness:** with ideal bandwidth all bursts have the same contrast. The finer ones fade first.
+  How far they stay visible shows the set's bandwidth.
+- **Luma/chroma separation:** on composite, the bursts near the colour subcarrier (PAL 4 and
+  4.8 MHz, NTSC 3 and 3.58 MHz) turn into colour patterns (cross-colour), more on simple
+  decoders, less with a comb filter. Switching a scaler between its composite modes shows the
+  difference clearly.
+
+**12 – Overscan and safe areas**
+- **White outline:** the edge of the active picture. A CRT normally hides it slightly.
+- **75 % grey outline (5 % in):** "action safe". It should be visible on all four sides.
+- **50 % grey outline (10 % in):** "title safe". It should always be well inside the screen.
+- The small centre cross shows whether the picture is centred.
+
+**13 – White window**
+- The box keeps the same size and position when you switch to it from the black field. If the
+  picture grows or breathes, the high-voltage regulation is weak.
+- The edges are sharp. Smears or ghosts to the right of the box point to the video amplifier or
+  to reflections in a long cable.
 
 ## How it differs from the real patterns
 
@@ -196,6 +340,10 @@ main differences:
 - **Colour:** each sample is `Y + (U·sin + V·cos)`, using one sine table read at a per-line
   offset that follows an exact free-running subcarrier phase. Flat colour areas (the NTSC bars)
   use precomputed waveforms.
+- **Extra patterns:** each has its own small picture tables in flash (190 KB for all 26) and
+  shares the standard's sync, burst and carrier tables. The pattern on screen is copied into one
+  50 KB RAM buffer first, because rendering from flash stalls on cache misses. A switch takes
+  effect at a frame start on both cores, and the subcarrier phase runs on unchanged.
 - **Two cores:** the I2S interrupt on core 1 renders the odd buffers, and a task on core 0
   renders the even ones.
 - **Tone:** the 1 kHz tone is stepped once per video line, so it is locked to the picture (PAL:
@@ -208,7 +356,8 @@ Details, measurements and the experiments that were rejected are in
 
 ```
 esp32/firmware/          ESP-IDF project (main20.c, fubk_synth20.c, generated tables *_tables.h)
-esp32/tools/             make_tables20.py (pattern data -> C tables + exact model), check20.py
+esp32/tools/             make_tables20.py (pattern data -> C tables + exact model), patterns20.py
+                         (the extra patterns), check20.py
 esp32/host/              PC test: the firmware's synthesis code == the Python model, byte for byte
 ref/                     Python reference: PT8631 data loader, PAL encoder, software PAL decoder
 data/fubk4x3.zip         PT8631 FuBK sample data, unchanged (read directly by the tools)
@@ -223,7 +372,9 @@ python3 -m venv venv && venv/bin/pip install -r requirements.txt
 cd esp32
 ../venv/bin/python tools/make_tables20.py          # writes firmware/main/*20_tables.h and out/
 ../venv/bin/python tools/make_tables20.py --test-field   # flat orange test field (used by the tests)
-make -C host test20                                # C synthesis == model (PAL, NTSC, 2-core split)
+../venv/bin/python tools/preview_sheet.py         # docs/patterns.png from out/preview_*.png
+make -C host test20                                # C synthesis == model (PAL, NTSC, 2-core split,
+                                                   # all patterns, pattern switching)
 ../venv/bin/python tools/check20.py out/model20_4frames.u8          # PAL: burst, chroma, anti-PAL
 ../venv/bin/python tools/check20.py --ntsc out/model20_ntsc_2frames.u8   # NTSC: bars vs EG-1
 ```

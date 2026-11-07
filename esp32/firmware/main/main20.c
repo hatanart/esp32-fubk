@@ -7,6 +7,8 @@
 //
 // Front panel (like the earlier box):
 //   GPIO4  button to GND ("D4"): toggles PAL / NTSC (saved in NVS, then restart)
+//   GPIO15 button to GND ("D15"): next pattern (crosshatch, dots, ...). Not saved: every start
+//          shows the real test card (FuBK / SMPTE bars) first
 //   GPIO12 LED: on in PAL      GPIO13 LED: on in NTSC
 //   GPIO18 1 kHz sine as PWM (312.5 kHz, 8 bit; RC low-pass it), updated once per video line,
 //          so it is locked to the picture (PAL: exactly 40 cycles per frame)
@@ -16,6 +18,7 @@
 // buffers) or hands it to a task on core 0 (even buffers). Each core keeps its own synthesis
 // state, renders its buffers and skips the other core's lines.
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 #include <assert.h>
 #include <math.h>
@@ -51,6 +54,8 @@
 static const char *TAG = "fubk20";
 
 #define PIN_BUTTON GPIO_NUM_4              // "D4", to GND, internal pull-up
+#define PIN_PATTERN GPIO_NUM_15            // "D15", to GND, internal pull-up (strapping pin: only
+                                           // silences the boot log if held at reset)
 #define PIN_LED_PAL GPIO_NUM_12            // strapping pin: the LED must pull it LOW at reset
 #define PIN_LED_NTSC GPIO_NUM_13
 #define PIN_AUDIO GPIO_NUM_18
@@ -63,7 +68,21 @@ static lldesc_t DMA_ATTR desc[2 * NBUF];
 static intr_handle_t isr_handle;
 static QueueHandle_t q_core0;
 static fubk20_state_t st[2];               // st[w] renders the buffers k with k % 2 == w
-static const fubk20_std_t *S;
+static const fubk20_std_t *S;              // the standard (timing); pattern 0 = its test card
+static const fubk20_std_t *PATS;           // its patterns
+// Patterns: 0 is the test card (tables in RAM). The extra ones are in flash; the one on screen is
+// copied to pat_ram first, because rendering from flash stalls on cache misses (up to 270 % of a
+// buffer's time right after a switch). While pat_ram is refilled, the screen shows black from
+// its own small RAM copy.
+enum { SLOT_CARD, SLOT_BLACK, SLOT_RAM };
+#define PAT_BLACK 10                       // "black" in patterns20.py
+static fubk20_std_t pat_ram, black_ram;
+static void *pat_arena;
+static const fubk20_std_t *slot_std[3];
+// pattern request from the button task: (slot + 1) << 24 | frame (low 24 bits) it starts at;
+// 0 = none. fill() hands it to both render states, which switch at that frame start.
+static volatile uint32_t pat_req;
+static uint32_t pat_seen[2];
 
 static volatile uint32_t last_done = NBUF - 1;     // last buffer handed out for refilling
 static volatile uint32_t last_di;                  // descriptor index at the previous interrupt
@@ -109,6 +128,13 @@ static void audio_init(void)
 static IRAM_ATTR void fill(uint32_t k)
 {
     fubk20_state_t *s = &st[k & 1];
+    uint32_t r = pat_req;
+    if (r != pat_seen[k & 1]) {
+        pat_seen[k & 1] = r;
+        // full frame number: the next one at or after s->frame with these low 24 bits
+        uint32_t frame = s->frame + (((r & 0xFFFFFFu) - s->frame) & 0xFFFFFFu);
+        fubk20_request(s, slot_std[(r >> 24) - 1], frame);
+    }
     // line lengths: PAL always 1280; NTSC 1271 + 1271, or 1272 + 1272 for every 9th pair. The
     // DMA reaches this buffer only after the other NBUF - 1, so its descriptors can change here.
     uint32_t n1 = fubk20_next_len(s);
@@ -309,18 +335,97 @@ static void save_std_and_restart(uint8_t v)
     esp_restart();
 }
 
+static void request_slot(uint32_t slot)
+{
+    // start 2 frames ahead: both render states see the request long before (within 1 ms)
+    uint32_t frame = *(volatile uint32_t *)&st[1].frame + 2;
+    __sync_synchronize();                          // copied tables visible before the request
+    pat_req = (slot + 1) << 24 | (frame & 0xFFFFFFu);
+}
+
+static bool ram_in_use(void)
+{
+    for (int w = 0; w < 2; w++) {
+        if (*(const fubk20_std_t *volatile *)&st[w].s == &pat_ram ||
+            *(const fubk20_std_t *volatile *)&st[w].pend == &pat_ram)
+            return true;
+    }
+    return false;
+}
+
+static void next_pattern(void)
+{
+    static uint32_t pat;
+    pat = (pat + 1) % FUBK20_NPAT;
+    if (pat == 0 || !pat_arena) {
+        // test card (RAM already); or no RAM buffer: render straight from flash
+        if (!pat_arena)
+            slot_std[SLOT_RAM] = &PATS[pat];
+        request_slot(pat == 0 ? SLOT_CARD : SLOT_RAM);
+        ESP_LOGI(TAG, "pattern %lu: %s", (unsigned long)pat, PATS[pat].name);
+        return;
+    }
+    if (ram_in_use()) {                            // black while the RAM copy is replaced
+        request_slot(SLOT_BLACK);
+        for (int i = 0; i < 50 && ram_in_use(); i++)
+            vTaskDelay(pdMS_TO_TICKS(10));
+        if (ram_in_use()) {
+            ESP_LOGW(TAG, "pattern switch timed out");
+            return;
+        }
+    }
+    int64_t t0 = esp_timer_get_time();
+    fubk20_pattern_load(PATS, pat, pat_arena, &pat_ram);
+    int64_t t1 = esp_timer_get_time();
+    request_slot(SLOT_RAM);
+    ESP_LOGI(TAG, "pattern %lu: %s (%lu bytes copied to RAM in %lld us)", (unsigned long)pat,
+             PATS[pat].name, (unsigned long)fubk20_pattern_bytes(PATS, pat), (long long)(t1 - t0));
+}
+
+static void patterns_init(void)
+{
+    slot_std[SLOT_CARD] = S;
+    slot_std[SLOT_BLACK] = &PATS[0];               // fallback: never used if black_ram loads
+    uint32_t mx = 0;
+    for (uint32_t k = 1; k < FUBK20_NPAT; k++) {
+        uint32_t n = fubk20_pattern_bytes(PATS, k);
+        if (n > mx)
+            mx = n;
+    }
+    assert(strstr(PATS[PAT_BLACK].name, "black"));
+    void *b = heap_caps_malloc(fubk20_pattern_bytes(PATS, PAT_BLACK), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    pat_arena = heap_caps_malloc(mx, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (b) {
+        fubk20_pattern_load(PATS, PAT_BLACK, b, &black_ram);
+        slot_std[SLOT_BLACK] = &black_ram;
+    }
+    slot_std[SLOT_RAM] = &pat_ram;
+    ESP_LOGI(TAG, "pattern RAM: %lu bytes %s; free internal heap %lu bytes", (unsigned long)mx,
+             pat_arena ? "allocated" : "NOT available (patterns render from flash)",
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+}
+
 static void button_task(void *arg)
 {
     uint8_t cur = (uint8_t)(uintptr_t)arg;
-    // wait until the button is released (it may be held at power-up)
-    while (gpio_get_level(PIN_BUTTON) == 0)
+    // wait until the buttons are released (they may be held at power-up)
+    while (gpio_get_level(PIN_BUTTON) == 0 || gpio_get_level(PIN_PATTERN) == 0)
         vTaskDelay(pdMS_TO_TICKS(20));
-    int low = 0;
+    int low = 0, plow = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(10));
         low = gpio_get_level(PIN_BUTTON) == 0 ? low + 1 : 0;
         if (low == 5)                              // 50 ms pressed: debounced
             save_std_and_restart(cur ^ 1);
+        // pattern button: one step per press (50 ms down; released for 50 ms before the next)
+        if (gpio_get_level(PIN_PATTERN) == 0) {
+            if (plow < 5 && ++plow == 5)
+                next_pattern();
+        } else if (plow >= 5) {
+            plow = plow >= 9 ? 0 : plow + 1;
+        } else {
+            plow = 0;
+        }
     }
 }
 
@@ -333,7 +438,8 @@ static void gpio_init(uint8_t ntsc)
     gpio_set_level(PIN_LED_NTSC, ntsc);
     gpio_set_level(PIN_LED_PAL, !ntsc);
     gpio_config_t in = {
-        .pin_bit_mask = 1ULL << PIN_BUTTON, .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pin_bit_mask = (1ULL << PIN_BUTTON) | (1ULL << PIN_PATTERN), .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&in));
 }
@@ -342,6 +448,7 @@ void app_main(void)
 {
     uint8_t ntsc = load_std();
     S = ntsc ? &fubk20_ntsc : &fubk20_pal;
+    PATS = ntsc ? fubk20_ntsc_pat : fubk20_pal_pat;
     gpio_init(ntsc);
     audio_init();
 
@@ -350,6 +457,7 @@ void app_main(void)
                                           MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
         assert(bufs[k]);
     }
+    patterns_init();
     q_core0 = xQueueCreate(NBUF, sizeof(uint32_t));
     xTaskCreatePinnedToCore(core0_worker, "fubk20w", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 0);
     xTaskCreatePinnedToCore(start_video, "video", 4096, NULL, 20, NULL, 1);

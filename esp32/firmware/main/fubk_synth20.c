@@ -17,6 +17,8 @@
 #define FUBK_TABLE_ATTR
 #define FUBK_HOT
 #endif
+#define FUBK_PAT_ATTR                    // extra patterns: flash (simple pictures, cache-friendly)
+#include <string.h>
 #include "fubk_synth20.h"
 #define FUBK20_TABLES_DATA
 #ifdef FUBK_TEST_FIELD
@@ -25,6 +27,7 @@
 #include "fubk20_tables.h"               // PAL: FuBK
 #endif
 #include "ntsc20_tables.h"               // NTSC: SMPTE bars
+#include "patterns20_tables.h"            // extra patterns, both standards
 
 #define BLANK 64
 #define B 32
@@ -47,6 +50,40 @@ _Static_assert((uint64_t)(N20_SPL + 1) * N20_PH_NUM + N20_PH_DEN < (1ull << 32),
     p##_car, p##_bu, p##_bv, p##_flat, p##_wtab, P##_WLEN, P##_LONG_PERIOD }
 const fubk20_std_t fubk20_pal = STD(f20, F20, "PAL");
 const fubk20_std_t fubk20_ntsc = STD(n20, N20, "NTSC");
+
+// an extra pattern: the standard's timing, sync, burst and carrier with its own picture tables
+#define PAT(p, P, nm, pb, yb, ypool, row_start, delta, uvpool, flat, wtab) {             \
+    nm, P##_SPL, P##_LINES, P##_A0, P##_NB, P##_BW0, P##_BWN, P##_ROWS,                  \
+    P##_CAR_N, P##_CAR_STEP, P##_CAR_INV, P##_PH_NUM, P##_PH_DEN,                        \
+    P##_VSWITCH, 1, pb, yb,                                                              \
+    p##_tmpl, p##_line_info, ypool, p##_rowmap, row_start, delta, uvpool,                \
+    p##_car, p##_bu, p##_bv, flat, wtab, P##_WLEN, P##_LONG_PERIOD }
+_Static_assert(PATTERNS20_COUNT + 1 == FUBK20_NPAT, "FUBK20_NPAT does not match patterns20_tables.h");
+const fubk20_std_t fubk20_pal_pat[FUBK20_NPAT] = { STD(f20, F20, "PAL FuBK"), F20_PATTERNS };
+const fubk20_std_t fubk20_ntsc_pat[FUBK20_NPAT] = { STD(n20, N20, "NTSC SMPTE bars"), N20_PATTERNS };
+
+typedef struct { uint32_t row_start, delta, ypool, uvpool, flat, wtab; } pat_size_t;
+static const pat_size_t pal_size[FUBK20_NPAT] = { { 0 }, F20_PATTERNS_SIZES };
+static const pat_size_t ntsc_size[FUBK20_NPAT] = { { 0 }, N20_PATTERNS_SIZES };
+
+#define AL4(n) (((n) + 3u) & ~3u)
+
+uint32_t fubk20_pattern_bytes(const fubk20_std_t *pats, uint32_t k)
+{
+    const pat_size_t *z = &(pats == fubk20_ntsc_pat ? ntsc_size : pal_size)[k];
+    return AL4(z->row_start) + AL4(z->delta) + AL4(z->ypool) + AL4(z->uvpool) + AL4(z->flat) + AL4(z->wtab);
+}
+
+void fubk20_pattern_load(const fubk20_std_t *pats, uint32_t k, void *ram, fubk20_std_t *dst)
+{
+    const fubk20_std_t *s = &pats[k];
+    const pat_size_t *z = &(pats == fubk20_ntsc_pat ? ntsc_size : pal_size)[k];
+    uint8_t *p = ram;
+    *dst = *s;
+#define CP(f) if (z->f) { memcpy(p, s->f, z->f); dst->f = (__typeof__(dst->f))(void *)p; p += AL4(z->f); }
+    CP(row_start) CP(delta) CP(ypool) CP(uvpool) CP(flat) CP(wtab)
+#undef CP
+}
 
 #ifdef FUBK_I2S16
 // The DAC takes the high byte of each 16-bit sample; with FUBK_SWAP the two samples of each
@@ -76,6 +113,8 @@ void fubk20_init(fubk20_state_t *st, const fubk20_std_t *s)
     st->acc = 0;
     st->vs = 0;
     st->g = 0;
+    st->pend = 0;
+    st->pend_frame = 0;
     for (int b = 0; b < F20_MAX_NB; b++)
         st->cur_y[b] = st->cur_uv[b] = 0;
 }
@@ -111,6 +150,10 @@ static inline void advance(fubk20_state_t *st)
     if (++st->line > s->lines) {
         st->line = 1;
         st->frame++;
+        if (st->pend && st->frame == st->pend_frame) {   // pattern switch: the first rows of a
+            st->s = st->pend;                            // field list all blocks, so the block
+            st->pend = 0;                                // list needs no reset
+        }
     }
 }
 
@@ -147,7 +190,10 @@ FUBK_HOT void fubk20_line(fubk20_state_t *st, fubk_sample_t *buf, uint32_t off)
     const uint32_t l = st->line, spl = s->spl, a0 = s->a0, nb = s->nb, n_end = a0 + B * nb;
     const uint32_t bw0 = s->bw0, bwn = s->bwn, n = s->car_n, wlen = s->wlen;
     const uint8_t *ypool = s->ypool, *flat = s->flat;
-    const int8_t *uvpool = s->uvpool, *wtab = s->wtab;
+    const int8_t *uvpool = s->uvpool;
+    // flat-colour waveforms: PAL has one per V-switch sign (+V, -V) for each colour
+    const int8_t *wtab = s->wtab ? s->wtab + (st->vs ? wlen : 0) : 0;
+    const uint32_t wstride = wlen << s->vswitch;
     const int16_t *bu = s->bu, *bv = s->bv;
 
     // carrier offsets for this line: index exact at mid-line (same steps as make_tables20.py:
@@ -206,7 +252,7 @@ FUBK_HOT void fubk20_line(fubk20_state_t *st, fubk_sample_t *buf, uint32_t off)
                     p[ODD1(j)] = W16(y[j + 1]);
                 }
             } else if (fid) {                            // flat colour: precomputed chroma
-                const int8_t *w = wtab + (fid - 1) * wlen + (a0 + b * B + ms) % n;
+                const int8_t *w = wtab + (fid - 1) * wstride + (a0 + b * B + ms) % n;
                 for (int j = 0; j < B; j += 2) {
                     p[ODD0(j)] = W16(y[j] + w[j]);
                     p[ODD1(j)] = W16(y[j + 1] + w[j + 1]);
@@ -231,7 +277,7 @@ FUBK_HOT void fubk20_line(fubk20_state_t *st, fubk_sample_t *buf, uint32_t off)
                 for (int j = 0; j < B; j += 2)
                     *op++ = PAIR(y[j], y[j + 1]);
             } else if (fid) {                            // flat colour: precomputed chroma
-                const int8_t *w = wtab + (fid - 1) * wlen + (a0 + b * B + ms) % n;
+                const int8_t *w = wtab + (fid - 1) * wstride + (a0 + b * B + ms) % n;
                 for (int j = 0; j < B; j += 2)
                     *op++ = PAIR(y[j] + w[j], y[j + 1] + w[j + 1]);
             } else {

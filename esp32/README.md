@@ -133,6 +133,34 @@ Default build = 20 MHz standard PAL (`FUBK_20MHZ=1`, the others off):
 - The 4fsc builds (`FUBK_20MHZ=0`) use a fractional APLL whose sigma-delta jitter beats at
   373.5 kHz (exact fraction) and crawls; `FUBK_LINE1136` freezes it but is not standard PAL.
 
+## Pattern button (GPIO15)
+
+- `tools/patterns20.py` draws the 13 extra patterns per standard on the same grid as the test
+  cards. Geometry is in square units (4:3, one unit = one picture row). Rectangles get exact
+  area coverage per sample; circles are 4 x 4 supersampled. Luma is shaped for 150 ns edges,
+  chroma for 400 ns. PAL line 623 is blanked from 1 us before its half-line equalising pulse.
+- `make_tables20.py` writes `firmware/main/patterns20_tables.h`: picture tables only
+  (row_start, delta, Y/UV blocks, flat colours), in flash. The `PAT()` initialiser in
+  fubk_synth20.c combines them with the standard's timing, sync, burst and carrier tables.
+- PAL flat colours: one chroma waveform per V-switch sign (2 x 1056 bytes per colour), so the
+  colour fields and bars need no multiplies. FuBK keeps the multiply path (few flat blocks; its
+  tables are unchanged).
+- RAM copy: rendering straight from flash worked, but right after a switch the first frame
+  missed the cache everywhere (PAL colour bars: 400 misses for the chroma waveforms), one render
+  took up to 270 % of its slot and the I2S interrupt fell more than 16 lines behind (the DMA then
+  replays old lines; seen as a 10 kHz dip in the logged sample rate). NTSC circles stayed above
+  100 % peak even when steady. Now the pattern on screen is copied into one heap buffer (the
+  largest pattern, ~50 KB; `fubk20_pattern_load`), and a 1.5 KB RAM copy of the black pattern
+  covers the gap while that buffer is refilled. If the buffer can't be allocated, patterns render
+  from flash as before (logged at start).
+- Switching: the button task writes `(slot + 1) << 24 | start frame`, 2 frames ahead (slots:
+  test card, black, RAM copy).
+  `fill()` passes it to its render state (`fubk20_request`), and both states switch at that
+  frame start. The frame counter keeps running, so FuBK's anti-PAL A/B frames stay in step with
+  the V-switch when you come back to it.
+- `make -C host test20` checks every pattern in both standards (split over 2 states) and a
+  switching sequence against the model. `out/preview_*.png` show the pictures.
+
 ## Front panel and NTSC (20 MHz build)
 
 | pin | function |

@@ -45,7 +45,8 @@ test: all
 	cmp ../out/c_l36_i2s16_4frames.u8 $(MODEL_L36) && echo "1136 lines, I2S16 layout: identical to the model"
 
 # 20 MHz synthesis (fubk_synth20.c, PAL + NTSC) against make_tables20.py's model
-DEPS20 = host20_test.c $(SRC)/fubk_synth20.c $(SRC)/fubk_synth20.h $(SRC)/fubk20_tables.h $(SRC)/ntsc20_tables.h
+DEPS20 = host20_test.c $(SRC)/fubk_synth20.c $(SRC)/fubk_synth20.h $(SRC)/fubk20_tables.h $(SRC)/ntsc20_tables.h \
+         $(SRC)/patterns20_tables.h
 host20_u8: $(DEPS20)
 	$(CC) $(CFLAGS) -o $@ host20_test.c $(SRC)/fubk_synth20.c
 host20_i2s16: $(DEPS20)
@@ -66,6 +67,14 @@ test20: host20_u8 host20_i2s16 host20_test_i2s16
 	cmp ../out/c20_ntsc_u8.u8 ../out/model20_ntsc_2frames.u8 && echo "NTSC, u8: identical to the model"
 	./host20_i2s16 ../out/c20_ntsc_split.u8 2 1 1
 	cmp ../out/c20_ntsc_split.u8 ../out/model20_ntsc_2frames.u8 && echo "NTSC, I2S16, split over 2 states: identical to the model"
+	@for k in 01 02 03 04 05 06 07 08 09 10 11 12 13; do \
+	  ./host20_i2s16 ../out/c20_pal_pat$$k.u8 1 1 0 $$k && cmp ../out/c20_pal_pat$$k.u8 ../out/model20_pal_pat$$k.u8 && \
+	  ./host20_i2s16 ../out/c20_ntsc_pat$$k.u8 1 1 1 $$k && cmp ../out/c20_ntsc_pat$$k.u8 ../out/model20_ntsc_pat$$k.u8 || exit 1; \
+	done 2>/dev/null; echo "patterns 1-13, PAL + NTSC, split: identical to the model"
+	./host20_i2s16 ../out/c20_pal_switch.u8 5 1 0 0,1,4,7,0
+	cmp ../out/c20_pal_switch.u8 ../out/model20_pal_switch.u8 && echo "PAL pattern switching (FuBK, crosshatch, bars, red, FuBK): identical to the model"
+	./host20_u8 ../out/c20_ntsc_switch.u8 4 0 1 0,4,8,0
+	cmp ../out/c20_ntsc_switch.u8 ../out/model20_ntsc_switch.u8 && echo "NTSC pattern switching (SMPTE, bars, green, SMPTE): identical to the model"
 
 clean20:
 	rm -f host20_u8 host20_i2s16 host20_test_i2s16 ../out/c20_*.u8

@@ -192,7 +192,10 @@ def smpte_picture():
 
 
 # --- tables ------------------------------------------------------------------------------------
-def build(std, Y, U, V):
+def build(std, Y, U, V, flat=None):
+    """flat: precompute flat-colour chroma (default: NTSC only; PAL FuBK has few flat blocks)."""
+    if flat is None:
+        flat = std is NTSC
     t = t_line(std)
     width = std.widths
     tmpl = np.zeros((len(KINDS), std.spl), np.int64)
@@ -220,7 +223,8 @@ def build(std, Y, U, V):
     Yq = np.round(Y / LSB_MV).astype(np.int64)
     Uq = np.round(U / LSB_MV).astype(np.int64)
     Vq = np.round(V / LSB_MV).astype(np.int64)
-    assert Yq.shape == (std.data_frames, std.rows, std.spl), Yq.shape
+    nd = Yq.shape[0]                                # data frames: 2 (FuBK A/B) or 1
+    assert Yq.shape == (nd, std.rows, std.spl), Yq.shape
     outside = np.ones(std.spl, bool)
     outside[std.a0:std.a0 + std.na] = False
     assert std.a0 + std.na <= std.spl
@@ -232,10 +236,10 @@ def build(std, Y, U, V):
     # block pools: Y blocks (uint8, Y + BLANK), UV blocks (int8 interleaved). UV block 0 = zero.
     zero = np.zeros(2 * B, np.int64)
     ypool, uvpool, yid, uvid = [], [zero], {}, {zero.tobytes(): 0}
-    nrows = std.data_frames * std.rows
+    nrows = nd * std.rows
     ymap = np.zeros((nrows, std.nb), np.int64)
     uvmap = np.zeros((nrows, std.nb), np.int64)
-    for df in range(std.data_frames):
+    for df in range(nd):
         for r in range(std.rows):
             for bi in range(std.nb):
                 s = slice(std.a0 + bi * B, std.a0 + (bi + 1) * B)
@@ -260,7 +264,7 @@ def build(std, Y, U, V):
     UV_BITS = max(1, int(len(uvpool) - 1).bit_length())
     assert POS_BITS + Y_BITS + UV_BITS <= 32 and std.nb <= 1 << POS_BITS
     delta, row_start = [], [0]
-    for df in range(std.data_frames):
+    for df in range(nd):
         for r in range(std.rows):
             i = df * std.rows + r
             for bi in range(std.nb):
@@ -280,23 +284,28 @@ def build(std, Y, U, V):
         if rowmap[l - 1] != 0xFFFF and not (tmpl[kd, std.a0:std.a0 + std.na] == BLANK).all():
             v |= 0x40
         info.append(v)
-    # NTSC: flat-colour blocks (one U, V over the whole block) get their chroma as a precomputed
+    # Flat-colour blocks (one U, V over the whole block) get their chroma as a precomputed
     # waveform over one carrier period (+ one block), so the synth does a table read instead of
-    # two multiplies. Exact: the NTSC carrier repeats every car_n samples, and
-    # car[n + mc] = car[(n + ms + qshift) mod car_n]. (PAL: the V-switch would need two tables
-    # per colour and FuBK has few flat blocks, so it keeps the multiply path.)
-    flat = np.zeros(len(uvpool), np.int64)
+    # two multiplies. Exact: the carrier repeats every car_n samples, and
+    # car[n + mc] = car[(n + ms + qshift) mod car_n]. PAL needs one waveform per V-switch sign
+    # (qshift for +V, 3 qshift for -V): colour i uses rows 2 (i - 1) and 2 (i - 1) + 1.
+    flat_ix = np.zeros(len(uvpool), np.int64)
     wtab = []
-    if std is NTSC:
-        qshift = (std.car_n // 4 * std.car_inv) % std.car_n
+    if flat:
+        q = std.car_n // 4
+        shifts = [(q * std.car_inv) % std.car_n]
+        if std.vswitch:
+            shifts.append((3 * q * std.car_inv) % std.car_n)
         kk = np.arange(std.car_n + B)
         for i, uvb in enumerate(uvpool):
             u, v = uvb[0::2], uvb[1::2]
             if i and (u == u[0]).all() and (v == v[0]).all():
-                wtab.append((u[0] * car[kk % std.car_n] + v[0] * car[(kk + qshift) % std.car_n]
-                             + (1 << (CAR_Q - 1))) >> CAR_Q)
-                flat[i] = len(wtab)
-    return dict(std=std, tmpl=tmpl, bu=bu, bv=bv, car=car, Yq=Yq, Uq=Uq, Vq=Vq, flat=flat,
+                for sh in shifts:
+                    wtab.append((u[0] * car[kk % std.car_n] + v[0] * car[(kk + sh) % std.car_n]
+                                 + (1 << (CAR_Q - 1))) >> CAR_Q)
+                flat_ix[i] = len(wtab) // len(shifts)
+        assert len(wtab) // len(shifts) <= 255
+    return dict(std=std, tmpl=tmpl, bu=bu, bv=bv, car=car, Yq=Yq, Uq=Uq, Vq=Vq, flat=flat_ix,
                 wtab=np.array(wtab, np.int64).reshape(-1, std.car_n + B),
                 ypool=np.array(ypool), uvpool=np.array(uvpool), ymap=ymap, uvmap=uvmap,
                 delta=np.array(delta, np.int64), row_start=np.array(row_start),
@@ -324,15 +333,18 @@ def line_len(std, g):
 
 
 def model(tb, n_frames=None):
-    """Integer reference of fubk_synth20.c: the uint8 stream and the start of every line."""
-    std = tb['std']
-    n_frames = n_frames or std.period_frames
+    """Integer reference of fubk_synth20.c: the uint8 stream and the start of every line.
+    tb can be a list: frame f uses tb[min(f, len - 1)] (pattern switches at frame starts)."""
+    tbs = tb if isinstance(tb, list) else [tb]
+    std = tbs[0]['std']
+    n_frames = n_frames or (len(tbs) if len(tbs) > 1 else std.period_frames)
     n = np.arange(std.spl)
     a = slice(std.a0, std.a0 + std.na)
     w = slice(std.bw0, std.bw0 + std.bwn)
     acc, vs, g = 0, 0, 0
     lines, offs, pos = [], [], 0
     for f in range(n_frames):
+        tb = tbs[min(f, len(tbs) - 1)]
         for l in range(1, std.lines + 1):
             ms, mc = line_offsets(std, acc, vs)
             S, C = tb['car'][n + ms], tb['car'][n + mc]
@@ -342,7 +354,7 @@ def model(tb, n_frames=None):
                 line[w] += (tb['bu'] * S[w] + tb['bv'] * C[w] + (1 << (CAR_Q + BURST_Q - 1))) >> (CAR_Q + BURST_Q)
             row = tb['rowmap'][l - 1]
             if row != 0xFFFF:
-                df = f % std.data_frames
+                df = f % tb['Yq'].shape[0]
                 y = tb['Yq'][df, row, a] + BLANK
                 c = (tb['Uq'][df, row, a] * S[a] + tb['Vq'][df, row, a] * C[a] + (1 << (CAR_Q - 1))) >> CAR_Q
                 line[a] = y + line[a] - BLANK + c if info & 0x40 else y + c
@@ -361,9 +373,9 @@ def model(tb, n_frames=None):
 
 
 # --- C header ----------------------------------------------------------------------------------
-def c_array(f, ctype, name, a, per_line=24):
+def c_array(f, ctype, name, a, per_line=24, attr='FUBK_TABLE_ATTR'):
     a = np.asarray(a).ravel()
-    f.write(f'static const {ctype} FUBK_TABLE_ATTR {name}[{len(a)}] = {{\n')
+    f.write(f'static const {ctype} {attr} {name}[{len(a)}] = {{\n')
     for i in range(0, len(a), per_line):
         f.write('    ' + ', '.join(str(int(x)) for x in a[i:i + per_line]) + ',\n')
     f.write('};\n')
@@ -406,6 +418,47 @@ def write_header(path, tb, what):
         f.write('#endif\n')
 
 
+def write_patterns_header(path, items):
+    """items: (std, tb, name) per extra pattern. Only the picture tables (in flash); timing, sync,
+    burst and carrier come from the standard's main tables. Ends with the struct initialisers."""
+    PAT_LIST = {'PAL': [], 'NTSC': []}
+    SIZES = {'PAL': [], 'NTSC': []}
+    with open(path, 'w') as f:
+        f.write('// Generated by esp32/tools/make_tables20.py - do not edit.\n')
+        f.write('// Extra patterns (pattern button): picture tables only, in flash.\n#pragma once\n\n')
+        f.write('#ifdef FUBK20_TABLES_DATA   // data only in fubk_synth20.c\n')
+        for i, (std, tb, name) in enumerate(items):
+            k = len(PAT_LIST[std.name]) + 1
+            q = f'{std.prefix}p{k:02d}'
+            pb, yb, ub = tb['bits']
+            f.write(f'\n// {std.name} pattern {k}: {name}\n')
+            A = 'FUBK_PAT_ATTR'
+            c_array(f, 'uint16_t', f'{q}_row_start', tb['row_start'], attr=A)
+            c_array(f, 'uint32_t', f'{q}_delta', tb['delta'], 8, attr=A)
+            c_array(f, 'uint8_t', f'{q}_ypool', tb['ypool'], 32, attr=A)
+            c_array(f, 'int8_t', f'{q}_uvpool', tb['uvpool'], 32, attr=A)
+            if len(tb['wtab']):
+                c_array(f, 'uint8_t', f'{q}_flat', tb['flat'], 32, attr=A)
+                c_array(f, 'int8_t', f'{q}_wtab', tb['wtab'], 32, attr=A)
+                fl, wt = f'{q}_flat', f'{q}_wtab'
+            else:
+                fl, wt = '0', '0'
+            nfl = len(tb['flat']) if len(tb['wtab']) else 0
+            SIZES[std.name].append(f"{{{2 * tb['row_start'].size}, {4 * tb['delta'].size}, {tb['ypool'].size}, "
+                                   f"{tb['uvpool'].size}, {nfl}, {tb['wtab'].size}}}")
+            PAT_LIST[std.name].append(f'PAT({std.prefix}, {std.prefix.upper()}, "{std.name} {name}", {pb}, {yb}, '
+                                 f'{q}_ypool, {q}_row_start, {q}_delta, {q}_uvpool, {fl}, {wt})')
+        for std, macro in ((PAL, 'F20_PATTERNS'), (NTSC, 'N20_PATTERNS')):
+            f.write(f'\n#define {macro} \\\n    ' + ', \\\n    '.join(PAT_LIST[std.name]) + '\n')
+            f.write(f'// bytes of row_start, delta, ypool, uvpool, flat, wtab (for copying a pattern to RAM)\n')
+            f.write(f'#define {macro}_SIZES ' + ', '.join(SIZES[std.name]) + '\n')
+        n = {len(v) for v in PAT_LIST.values()}
+        assert len(n) == 1
+        f.write(f'#define PATTERNS20_COUNT {len(PAT_LIST["PAL"])}   // extra patterns per standard\n')
+        f.write('#endif\n')
+    return n.pop() + 1
+
+
 def report(tb):
     std = tb['std']
     sizes = dict(tmpl=tb['tmpl'].size, burst=4 * std.bwn, car=2 * tb['car'].size,
@@ -430,14 +483,50 @@ def main():
     else:
         jobs = [(PAL, fubk_picture(), 'fubk20_tables.h', 'model20_4frames.u8', 'FuBK test card'),
                 (NTSC, smpte_picture(), 'ntsc20_tables.h', 'model20_ntsc_2frames.u8', 'SMPTE colour bars')]
+    base = {}
     for std, pic, hname, mname, what in jobs:
         tb = build(std, *pic)
+        base[std.name] = tb
         report(tb)
         write_header(os.path.join(main_dir, hname), tb, what)
         m, offs = model(tb)
         m.tofile(os.path.join(outdir, mname))
         np.save(os.path.join(outdir, mname.replace('.u8', '_offsets.npy')), offs)
         print(f'  wrote firmware/main/{hname}, out/{mname} ({len(offs)} lines, {len(m)} samples)')
+    if a.test_field:
+        return
+
+    # extra patterns: tables, a 1-frame model each, previews, and a switching sequence per standard
+    import patterns20 as pt
+    from PIL import Image
+    items, tbs = [], {'PAL': [base['PAL']], 'NTSC': [base['NTSC']]}
+    total = 0
+    for std in (PAL, NTSC):
+        for k, (name, fn) in enumerate(pt.PATTERNS, 1):
+            pic = fn(std)
+            tb = build(std, *pic, flat=True)
+            items.append((std, tb, name))
+            tbs[std.name].append(tb)
+            sz = 2 * tb['row_start'].size + 4 * tb['delta'].size + tb['ypool'].size + tb['uvpool'].size \
+                + tb['wtab'].size + (len(tb['flat']) if len(tb['wtab']) else 0)
+            total += sz
+            col = (tb['uvmap'] != 0).sum(1).max()
+            print(f'  {std.name} pattern {k:2d} {name:24s} {sz / 1024:6.1f} KB, {len(tb["wtab"]) // (1 + std.vswitch):2d} flat colours, '
+                  f'colour blocks per line max {col}')
+            m, offs = model(tb, 1)
+            tag = 'pal' if std is PAL else 'ntsc'
+            m.tofile(os.path.join(outdir, f'model20_{tag}_pat{k:02d}.u8'))
+            img, w = pt.to_rgb8(std, *pic)
+            Image.fromarray(img).resize((w, img.shape[0]), Image.LANCZOS).save(
+                os.path.join(outdir, f'preview_{tag}_pat{k:02d}.png'))
+    npat = write_patterns_header(os.path.join(main_dir, 'patterns20_tables.h'), items)
+    print(f'  wrote firmware/main/patterns20_tables.h: {npat - 1} extra patterns per standard, {total / 1024:.1f} KB in flash')
+    # switching sequence (frames): PAL FuBK, crosshatch, bars, red, FuBK; NTSC SMPTE, bars, green, SMPTE
+    for std, seq in ((PAL, [0, 1, 4, 7, 0]), (NTSC, [0, 4, 8, 0])):
+        tag = 'pal' if std is PAL else 'ntsc'
+        m, offs = model([tbs[std.name][k] for k in seq])
+        m.tofile(os.path.join(outdir, f'model20_{tag}_switch.u8'))
+        print(f'  out/model20_{tag}_switch.u8: patterns {seq}, one frame each')
 
 
 if __name__ == '__main__':
