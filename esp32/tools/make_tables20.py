@@ -66,6 +66,11 @@ class Std:
     line_to_row: object
     extra: dict = field(default_factory=dict)
     long_period: int = 0          # NTSC: every long_period-th line pair is 1 sample longer per line
+    burst_rot: int = 0            # burst phase against the picture, steps of 360 / car_n deg
+
+    @property
+    def burst_ofs(self):          # the same rotation as a carrier index offset
+        return (self.burst_rot % self.car_n) * self.car_inv % self.car_n
 
     @property
     def na(self):
@@ -112,6 +117,13 @@ NTSC = Std('NTSC', 'n20', 1271, 525, 180, 34, 104, 76, 352, 63, 63, 352, False, 
            -40 * IRE_MV, {'N': 4.7e-6, 'E': 2.3e-6, 'B': 1271 / 2 / FS - 4.7e-6},
            (5.3e-6, 9, 20 * IRE_MV, -1.0, 0.0),
            _ntsc_kind, lambda l: 10 <= l <= 263 or 273 <= l <= 525, _ntsc_row)
+# PAL burst rotated by -26 steps = -9.1 deg against the picture. The ESP32 DAC output shifts the
+# picture chroma (higher levels) about 9 deg against the burst (near blanking); this undoes it.
+# Without it the FuBK anti-PAL boxes were not grey on PAL-D TVs (plasma, reverse-camera monitor)
+# and decoders without a full delay line (RetroScaler 2X, 77" OLED AV) showed moving Hanover bars.
+# Found 2026-11-08 by eye with the FUBK_BURST_TEST firmware (best between -27 and -24 steps).
+# NTSC looks right on screens and is left alone.
+PAL.burst_rot = -26
 NTSC.period_frames = 2           # (2 frames are enough for the checks)
 # The exact NTSC line is 227.5 cycles = 227.5 * 352 / 63 = 11440 / 9 samples: 8 line pairs of
 # 1271 samples and 1 pair of 1272 per 9 pairs. Average line rate exactly 15734.27 Hz (227.5 fsc
@@ -341,6 +353,7 @@ def model(tb, n_frames=None):
     n = np.arange(std.spl)
     a = slice(std.a0, std.a0 + std.na)
     w = slice(std.bw0, std.bw0 + std.bwn)
+    nw = np.arange(std.bw0, std.bw0 + std.bwn) + std.burst_ofs      # burst: rotated carrier
     acc, vs, g = 0, 0, 0
     lines, offs, pos = [], [], 0
     for f in range(n_frames):
@@ -351,7 +364,7 @@ def model(tb, n_frames=None):
             info = tb['line_info'][l - 1]
             line = tb['tmpl'][info & 0x3F].copy()
             if info & 0x80:
-                line[w] += (tb['bu'] * S[w] + tb['bv'] * C[w] + (1 << (CAR_Q + BURST_Q - 1))) >> (CAR_Q + BURST_Q)
+                line[w] += (tb['bu'] * tb['car'][nw + ms] + tb['bv'] * tb['car'][nw + mc] + (1 << (CAR_Q + BURST_Q - 1))) >> (CAR_Q + BURST_Q)
             row = tb['rowmap'][l - 1]
             if row != 0xFFFF:
                 df = f % tb['Yq'].shape[0]
@@ -393,7 +406,8 @@ def write_header(path, tb, what):
                      ('CAR_INV', std.car_inv), ('PH_NUM', std.ph_num), ('PH_DEN', std.ph_den),
                      ('VSWITCH', int(std.vswitch)), ('DATA_FRAMES', std.data_frames), ('ROWS', std.rows),
                      ('POS_BITS', pb), ('Y_BITS', yb), ('NFLAT', len(tb['wtab'])),
-                     ('WLEN', std.car_n + B), ('LONG_PERIOD', std.long_period)]:
+                     ('WLEN', std.car_n + B), ('LONG_PERIOD', std.long_period),
+                     ('BURST_OFS', std.burst_ofs)]:
             f.write(f'#define {P}_{k} {v}\n')
         f.write(f'\n#ifdef FUBK20_TABLES_DATA   // data only in fubk_synth20.c\n')
         c_array(f, 'uint8_t', f'{p}_tmpl', tb['tmpl'], 32)

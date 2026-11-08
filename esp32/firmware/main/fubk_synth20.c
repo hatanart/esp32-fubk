@@ -30,6 +30,8 @@
 #include "patterns20_tables.h"            // extra patterns, both standards
 
 #define BLANK 64
+#define F20_VBI VBI20_TTX                // PAL: teletext
+#define N20_VBI VBI20_CC                 // NTSC: closed captions
 #define B 32
 #define CAR_Q 14
 #define BURST_Q 6
@@ -47,7 +49,7 @@ _Static_assert((uint64_t)(N20_SPL + 1) * N20_PH_NUM + N20_PH_DEN < (1ull << 32),
     P##_CAR_N, P##_CAR_STEP, P##_CAR_INV, P##_PH_NUM, P##_PH_DEN,                        \
     P##_VSWITCH, P##_DATA_FRAMES, P##_POS_BITS, P##_Y_BITS,                              \
     p##_tmpl, p##_line_info, p##_ypool, p##_rowmap, p##_row_start, p##_delta, p##_uvpool, \
-    p##_car, p##_bu, p##_bv, p##_flat, p##_wtab, P##_WLEN, P##_LONG_PERIOD }
+    p##_car, p##_bu, p##_bv, p##_flat, p##_wtab, P##_WLEN, P##_LONG_PERIOD, P##_BURST_OFS, P##_VBI }
 const fubk20_std_t fubk20_pal = STD(f20, F20, "PAL");
 const fubk20_std_t fubk20_ntsc = STD(n20, N20, "NTSC");
 
@@ -57,7 +59,7 @@ const fubk20_std_t fubk20_ntsc = STD(n20, N20, "NTSC");
     P##_CAR_N, P##_CAR_STEP, P##_CAR_INV, P##_PH_NUM, P##_PH_DEN,                        \
     P##_VSWITCH, 1, pb, yb,                                                              \
     p##_tmpl, p##_line_info, ypool, p##_rowmap, row_start, delta, uvpool,                \
-    p##_car, p##_bu, p##_bv, flat, wtab, P##_WLEN, P##_LONG_PERIOD }
+    p##_car, p##_bu, p##_bv, flat, wtab, P##_WLEN, P##_LONG_PERIOD, P##_BURST_OFS, P##_VBI }
 _Static_assert(PATTERNS20_COUNT + 1 == FUBK20_NPAT, "FUBK20_NPAT does not match patterns20_tables.h");
 const fubk20_std_t fubk20_pal_pat[FUBK20_NPAT] = { STD(f20, F20, "PAL FuBK"), F20_PATTERNS };
 const fubk20_std_t fubk20_ntsc_pat[FUBK20_NPAT] = { STD(n20, N20, "NTSC SMPTE bars"), N20_PATTERNS };
@@ -65,6 +67,10 @@ const fubk20_std_t fubk20_ntsc_pat[FUBK20_NPAT] = { STD(n20, N20, "NTSC SMPTE ba
 typedef struct { uint32_t row_start, delta, ypool, uvpool, flat, wtab; } pat_size_t;
 static const pat_size_t pal_size[FUBK20_NPAT] = { { 0 }, F20_PATTERNS_SIZES };
 static const pat_size_t ntsc_size[FUBK20_NPAT] = { { 0 }, N20_PATTERNS_SIZES };
+
+#ifdef FUBK_BURST_TEST
+uint32_t fubk20_burst_ofs;
+#endif
 
 #define AL4(n) (((n) + 3u) & ~3u)
 
@@ -115,6 +121,7 @@ void fubk20_init(fubk20_state_t *st, const fubk20_std_t *s)
     st->g = 0;
     st->pend = 0;
     st->pend_frame = 0;
+    st->vbi_on = 0;
     for (int b = 0; b < F20_MAX_NB; b++)
         st->cur_y[b] = st->cur_uv[b] = 0;
 }
@@ -213,7 +220,13 @@ FUBK_HOT void fubk20_line(fubk20_state_t *st, fubk_sample_t *buf, uint32_t off)
     // sync and blanking (+ burst)
     if (info & 0x80) {
         copy_tmpl(buf, off, t, 0, bw0);
-        const int16_t *S = Sb + bw0, *C = Cb + bw0;
+        // burst carrier: rotated against the picture by burst_ofs (index < car_n + spl: ms, r < n)
+        uint32_t r = s->burst_ofs;
+#ifdef FUBK_BURST_TEST
+        if (s->vswitch)
+            r = (r + fubk20_burst_ofs) % n;
+#endif
+        const int16_t *S = Sb + bw0 + r, *C = Cb + bw0 + r;
         for (uint32_t j = 0; j < bwn; j++) {
             int32_t c = (bu[j] * S[j] + bv[j] * C[j] + (1 << (CAR_Q + BURST_Q - 1))) >> (CAR_Q + BURST_Q);
             PUT(off + bw0 + j, t[bw0 + j] + c);
@@ -225,7 +238,11 @@ FUBK_HOT void fubk20_line(fubk20_state_t *st, fubk_sample_t *buf, uint32_t off)
     copy_tmpl(buf, off, t, n_end, spl);
 
     if (row == 0xFFFF) {
-        copy_tmpl(buf, off, t, a0, n_end);
+        // no picture: blanking, or a data line (teletext / captions; drawn on blanking)
+        if (st->vbi_on && s->vbi && vbi20_line(s->vbi, l, st->frame, st->vbi_buf, a0, n_end))
+            copy_tmpl(buf, off, st->vbi_buf, a0, n_end);
+        else
+            copy_tmpl(buf, off, t, a0, n_end);
     } else if (info & 0x40) {
         // a sync pulse sits inside the picture (PAL line 623)
         for (uint32_t b = 0; b < nb; b++) {

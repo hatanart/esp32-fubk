@@ -16,7 +16,8 @@ Composite video test patterns from a plain ESP32 and one resistor:
 One button switches between them, and two LEDs show which one is on. A second button steps
 through 13 everyday calibration patterns: crosshatch, dots, circles, colour bars, greyscale with
 PLUGE, purity fields, multiburst, overscan markers and a white window. A 1 kHz test tone, locked
-to the picture, comes out on another pin.
+to the picture, comes out on another pin. PAL carries a teletext test page (P100), and NTSC
+carries closed captions with a running clock.
 
 The ESP32's internal 8-bit DAC sends samples at 20 MS/s. The colour subcarrier is calculated
 for every sample, so the subcarrier frequency is exact and the 8-field PAL sequence (with the
@@ -25,7 +26,10 @@ so it has none of the sigma-delta clock jitter that makes slowly moving patterns
 composite projects.
 
 Tested on a Panasonic CRT, a 20-year-old plasma TV, a cheap reverse-camera monitor and a
-RetroScaler 2X.
+RetroScaler 2X and a modern OLED TV's AV input. The ESP32's DAC shifts the colour of the picture
+about 9° against the colour burst. The burst is turned back by the same amount (found by eye on
+these screens). Without that, the anti-PAL boxes were not grey and the RetroScaler and the OLED
+showed moving Hanover bars (horizontal colour stripes) on saturated colours.
 
 ## Hardware
 
@@ -175,6 +179,21 @@ of bandwidth, so thin red or blue lines smear. Horizontal lines are 2 picture li
 each field), so they don't flicker on interlaced TVs. The list order is fixed: new patterns are
 added at the end, so a number always means the same pattern.
 
+### Teletext (PAL) and closed captions (NTSC)
+
+The vertical blanking carries data, with every pattern:
+
+- **PAL: teletext page 100.** Press TEXT on the TV. The page is an engineering test page
+  (colour bars, the full character set, double height, flash and conceal, a Fastext row). The
+  header reads `ESP32 FuBK P100` with a clock that counts up from power-on. One packet goes out
+  per field (lines 20 and 333), so the 25-row page repeats twice a second.
+- **NTSC: closed captions CC1.** Turn on captions (CC1) on the TV. `NTSC TEST hh:mm:ss` appears
+  on the bottom caption row and changes every second, the time counted from power-on. Line 21,
+  field 1, pop-on captions.
+
+The teletext has been seen on a real TV. The captions so far pass only the software decoder
+(`make -C esp32/host testvbi`); many TVs sold outside North America have no caption decoder.
+
 ### What you should see
 
 Set up a CRT in this order: brightness and contrast first (patterns 5 and 10), then colour
@@ -297,7 +316,7 @@ main differences:
 | Level accuracy | Calibrated 1 V into 75 Ω | Depends on the 3.3 V supply and the resistor: about ±5 %. |
 | Output impedance | 75 Ω (good return loss) | 110 Ω plus the DAC's own impedance: long cables can show slight reflections (ghosts). |
 | Reconstruction filter | Yes | None. Each sample is held for 50 ns: chroma is 0.7 dB low at 4.43 MHz, but burst and colour drop by the same amount, so the TV's colour gain corrects it. Fine luma detail is about 1 dB low at 5 MHz. Image frequencies at 20 MHz − f are left in; TVs filter them out. |
-| Vertical blanking | Optional test lines (VITS), teletext, WSS | Empty, black. |
+| Vertical blanking | Optional test lines (VITS), teletext, WSS | One teletext line per field (PAL, one fixed page) or line-21 captions (NTSC). No VITS, WSS or VPS. |
 | Audio | Usually on the RF carrier, or a separate balanced line output | A separate PWM pin, baseband only. |
 
 ### PAL FuBK
@@ -310,7 +329,8 @@ main differences:
 - **Anti-PAL boxes:** these are correct. The two data frames from the PT8631 alternate, so the
   boxes show grey on a PAL-D (delay-line) TV and colour on a simple PAL-S decoder.
 - **Timing:** standard 625/50: 64.000 µs lines, 4.7 µs sync, 10-cycle burst at 135° / 225°, and
-  exact fsc 4 433 618.75 Hz. Burst amplitude is within 1 % and phase within 1° of nominal (8-bit rounding included). The
+  exact fsc 4 433 618.75 Hz. In the samples the burst sits 9.1° early (126° / 216°): the ESP32 DAC
+  delays the picture's colour by about that much, so on the screen they match again. Burst amplitude is within 1 % and phase within 1° of nominal (8-bit rounding included). The
   SC-H phase (subcarrier to sync timing) is not set to a defined value.
 - **Edges:** sync rise time is 250 ns (the standard allows 200 ± 100 ns).
 
@@ -346,6 +366,11 @@ main differences:
   effect at a frame start on both cores, and the subcarrier phase runs on unchanged.
 - **Two cores:** the I2S interrupt on core 1 renders the odd buffers, and a task on core 0
   renders the even ones.
+- **Teletext and captions:** the data lines are drawn sample by sample into blank lines
+  (`vbi20.c`). Teletext bits are 320/111 samples long, so each sample is looked up from its
+  position in the bit and the 5 nearest bits (raised-cosine pulses, no energy above 5.2 MHz). The
+  packet, the header clock and the caption text all follow from the frame counter, so both cores
+  agree without sharing anything.
 - **Tone:** the 1 kHz tone is stepped once per video line, so it is locked to the picture (PAL:
   exactly 40 cycles per frame).
 
@@ -355,12 +380,14 @@ Details, measurements and the experiments that were rejected are in
 ## Repository layout
 
 ```
-esp32/firmware/          ESP-IDF project (main20.c, fubk_synth20.c, generated tables *_tables.h)
+esp32/firmware/          ESP-IDF project (main20.c, fubk_synth20.c, vbi20.c, generated tables *_tables.h)
 esp32/tools/             make_tables20.py (pattern data -> C tables + exact model), patterns20.py
-                         (the extra patterns), check20.py
+                         (the extra patterns), make_vbi20.py (teletext page, data pulse shapes),
+                         check20.py, check_vbi20.py (decodes the teletext / captions back)
 esp32/host/              PC test: the firmware's synthesis code == the Python model, byte for byte
 ref/                     Python reference: PT8631 data loader, PAL encoder, software PAL decoder
 data/fubk4x3.zip         PT8631 FuBK sample data, unchanged (read directly by the tools)
+data/TEST25              the teletext test page, unchanged
 ```
 
 The generated tables are checked in, so building the firmware needs only ESP-IDF.
@@ -373,10 +400,12 @@ cd esp32
 ../venv/bin/python tools/make_tables20.py          # writes firmware/main/*20_tables.h and out/
 ../venv/bin/python tools/make_tables20.py --test-field   # flat orange test field (used by the tests)
 ../venv/bin/python tools/preview_sheet.py         # docs/patterns.png from out/preview_*.png
+../venv/bin/python tools/make_vbi20.py            # firmware/main/vbi20_tables.h from data/TEST25
 make -C host test20                                # C synthesis == model (PAL, NTSC, 2-core split,
                                                    # all patterns, pattern switching)
 ../venv/bin/python tools/check20.py out/model20_4frames.u8          # PAL: burst, chroma, anti-PAL
 ../venv/bin/python tools/check20.py --ntsc out/model20_ntsc_2frames.u8   # NTSC: bars vs EG-1
+make -C host testvbi PY=../../venv/bin/python      # teletext / captions decoded back, other lines unchanged
 ```
 
 ### Older 4×fsc build
@@ -394,6 +423,9 @@ APLL. Its clock jitter makes slowly moving patterns. It is kept for comparison; 
   in Karsten Hervø Hansen's [KarstenHervoeHansen/PTV](https://github.com/KarstenHervoeHansen/PTV)
   repository. `data/fubk4x3.zip` holds those files unchanged (`FUBK4X3/ANTIPAL/` and
   `FUBK4X3/`). The tools turn them into the tables in `esp32/firmware/main/fubk20_tables.h`.
+- **Teletext test page:** `TEST25` from the teletext sample pages at
+  [mdfs.net](https://mdfs.net/System/Teletext/Samples/), unchanged in `data/TEST25`; its header
+  row is replaced by our own.
 - Ideas and ESP32 I2S/DAC setup:
   - [rossumur/esp_8_bit](https://github.com/rossumur/esp_8_bit)
   - [bitluni/ESP32CompositeVideo](https://github.com/bitluni/ESP32CompositeVideo)
@@ -410,5 +442,7 @@ The code, tools and documentation of this project are released into the public d
 This does **not** cover third-party material, which stays with its owners:
 - the PT8631 FuBK pattern data, both in `data/fubk4x3.zip` and in the tables generated from it
   (`esp32/firmware/main/fubk*_tables*.h`)
+- the teletext test page `data/TEST25` and the page data generated from it
+  (`esp32/firmware/main/vbi20_tables.h`)
 
 See [Credits](#credits) for where it comes from.

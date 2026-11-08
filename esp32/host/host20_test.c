@@ -1,5 +1,5 @@
 // Host test for fubk_synth20.c: write N frames of plain uint8 codes.
-//   host20 <out.u8> <frames> [split] [ntsc] [patterns]
+//   host20 <out.u8> <frames> [split] [ntsc] [patterns] [vbi] [first frame]
 // patterns: comma list, frame f shows pattern list[min(f, len - 1)] (default "0"). The switch is
 // requested before every buffer for the next frame start, as the firmware's pattern button does.
 // split = 1: render like the dual-core firmware (main20.c): 2 lines per buffer, state 0 renders
@@ -7,6 +7,7 @@
 // one, and state 1 starts by skipping buffer 0.
 // With -DFUBK_I2S16 the buffers use the firmware layout (16-bit, pairs swapped) and are
 // unpacked before writing, so the output must be the same in every mode.
+// vbi = 1: teletext / captions on. first frame: the frame counter's start (data clocks).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,7 +17,7 @@
 int main(int argc, char **argv)
 {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <out.u8> <frames> [split] [ntsc] [patterns]\n", argv[0]);
+        fprintf(stderr, "usage: %s <out.u8> <frames> [split] [ntsc] [patterns] [vbi] [first frame]\n", argv[0]);
         return 1;
     }
     int split = argc > 3 && atoi(argv[3]);
@@ -53,6 +54,10 @@ int main(int argc, char **argv)
     fubk20_state_t st[2];
     fubk20_init(&st[0], s);
     fubk20_init(&st[1], s);
+    for (int w = 0; w < 2; w++) {
+        st[w].vbi_on = argc > 6 && atoi(argv[6]);
+        st[w].frame = argc > 7 ? (uint32_t)strtoul(argv[7], 0, 0) : 0;
+    }
     if (split) {                                      // as main20.c: state 1 starts at buffer 1
         fubk20_skip(&st[1]);
         fubk20_skip(&st[1]);

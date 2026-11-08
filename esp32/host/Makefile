@@ -46,13 +46,14 @@ test: all
 
 # 20 MHz synthesis (fubk_synth20.c, PAL + NTSC) against make_tables20.py's model
 DEPS20 = host20_test.c $(SRC)/fubk_synth20.c $(SRC)/fubk_synth20.h $(SRC)/fubk20_tables.h $(SRC)/ntsc20_tables.h \
-         $(SRC)/patterns20_tables.h
+         $(SRC)/patterns20_tables.h $(SRC)/vbi20.c $(SRC)/vbi20.h $(SRC)/vbi20_tables.h
+SRC20 = host20_test.c $(SRC)/fubk_synth20.c $(SRC)/vbi20.c
 host20_u8: $(DEPS20)
-	$(CC) $(CFLAGS) -o $@ host20_test.c $(SRC)/fubk_synth20.c
+	$(CC) $(CFLAGS) -o $@ $(SRC20)
 host20_i2s16: $(DEPS20)
-	$(CC) $(CFLAGS) -DFUBK_I2S16 -o $@ host20_test.c $(SRC)/fubk_synth20.c
+	$(CC) $(CFLAGS) -DFUBK_I2S16 -o $@ $(SRC20)
 host20_test_i2s16: $(DEPS20)
-	$(CC) $(CFLAGS) -DFUBK_I2S16 -DFUBK_TEST_FIELD -o $@ host20_test.c $(SRC)/fubk_synth20.c
+	$(CC) $(CFLAGS) -DFUBK_I2S16 -DFUBK_TEST_FIELD -o $@ $(SRC20)
 
 test20: host20_u8 host20_i2s16 host20_test_i2s16
 	./host20_u8 ../out/c20_u8.u8 4
@@ -75,6 +76,20 @@ test20: host20_u8 host20_i2s16 host20_test_i2s16
 	cmp ../out/c20_pal_switch.u8 ../out/model20_pal_switch.u8 && echo "PAL pattern switching (FuBK, crosshatch, bars, red, FuBK): identical to the model"
 	./host20_u8 ../out/c20_ntsc_switch.u8 4 0 1 0,4,8,0
 	cmp ../out/c20_ntsc_switch.u8 ../out/model20_ntsc_switch.u8 && echo "NTSC pattern switching (SMPTE, bars, green, SMPTE): identical to the model"
+
+# Data lines (teletext / captions): decoded back by tools/check_vbi20.py; all other lines must be
+# unchanged. Includes the clock rollover 00:59:59 -> 01:00:00.
+PY ?= python3
+testvbi: host20_i2s16
+	./host20_i2s16 ../out/v_pal_on.u8 14 1 0 0 1 0 && ./host20_i2s16 ../out/v_pal_off.u8 14 1 0 0 0 0
+	$(PY) ../tools/check_vbi20.py pal ../out/v_pal_on.u8 ../out/v_pal_off.u8 0
+	./host20_i2s16 ../out/v_pal_on.u8 26 1 0 0 1 89975 && ./host20_i2s16 ../out/v_pal_off.u8 26 1 0 0 0 89975
+	$(PY) ../tools/check_vbi20.py pal ../out/v_pal_on.u8 ../out/v_pal_off.u8 89975
+	./host20_i2s16 ../out/v_ntsc_on.u8 50 1 1 0 1 0 && ./host20_i2s16 ../out/v_ntsc_off.u8 50 1 1 0 0 0
+	$(PY) ../tools/check_vbi20.py ntsc ../out/v_ntsc_on.u8 ../out/v_ntsc_off.u8 0
+	./host20_i2s16 ../out/v_ntsc_on.u8 70 1 1 0 1 107850 && ./host20_i2s16 ../out/v_ntsc_off.u8 70 1 1 0 0 107850
+	$(PY) ../tools/check_vbi20.py ntsc ../out/v_ntsc_on.u8 ../out/v_ntsc_off.u8 107850
+	rm -f ../out/v_*.u8
 
 clean20:
 	rm -f host20_u8 host20_i2s16 host20_test_i2s16 ../out/c20_*.u8

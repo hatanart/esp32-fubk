@@ -1,7 +1,7 @@
 """Check a 20 MHz composite stream (uint8 codes, spl x lines per frame) by synchronous
 demodulation with the exact subcarrier from a free-running sample counter.
 
-PAL (default): FuBK - burst 150 mV at 135/225 deg, chroma vs source, anti-PAL grey with PAL-D,
+PAL (default): FuBK - burst 150 mV at 135/225 deg (less the DAC correction), chroma vs source, anti-PAL grey with PAL-D,
 the orange patch. --test-field: the flat orange PAL field.
 NTSC (--ntsc): SMPTE bars - burst 143 mV (20 IRE) at 180 deg, every bar/box against EG-1.
 usage: check20.py codes.u8 [--test-field | --ntsc]
@@ -70,8 +70,9 @@ print(f'burst: amplitude {amp.min():.2f} .. {amp.max():.2f} mV (want {std.burst[
 if std.vswitch:
     a1 = np.array([x for x, s in ang if s > 0])
     a2 = np.array([x for x, s in ang if s < 0])
-    print(f'       phase {a1.min():.2f} .. {a1.max():.2f} deg on +V lines (want 135), '
-          f'{a2.min():.2f} .. {a2.max():.2f} on -V lines (want 225)')
+    rot = std.burst_rot * 360 / std.car_n        # built-in rotation against the DAC (make_tables20.py)
+    print(f'       phase {a1.min():.2f} .. {a1.max():.2f} deg on +V lines (want {135 + rot:.1f} = 135 {rot:+.1f}), '
+          f'{a2.min():.2f} .. {a2.max():.2f} on -V lines (want {225 + rot:.1f})')
 else:
     a1 = np.array([x for x, _ in ang])
     print(f'       phase {a1.min():.2f} .. {a1.max():.2f} deg (want 180)')

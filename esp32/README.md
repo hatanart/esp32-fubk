@@ -118,14 +118,28 @@ one per descriptor (2272 or 2280 bytes each). Excludes `FUBK_FRAME_LOCK`.
   ones; each keeps its own state and skips the other's lines. The log prints the load per core.
 - Checks: `../venv/bin/python tools/make_tables20.py [--test-field]`, `make -C host test20`
   (C == model, also split over 2 states), `../venv/bin/python tools/check20.py out/model20_4frames.u8`
-  (burst 150 mV at 135/225 deg, chroma error < 1 LSB, anti-PAL grey with PAL-D).
+  (burst 150 mV at 135/225 deg less the 9.1 deg DAC correction, chroma error < 1 LSB, anti-PAL
+  grey with PAL-D).
+- DAC phase correction (PAL only): the burst is rotated -26 carrier steps (-9.1 deg) against the
+  picture (`PAL.burst_rot` in make_tables20.py, `burst_ofs` in the tables). The DAC output shifts
+  the picture chroma (higher levels) about 9 deg against the burst (near blanking). Test build:
+  `idf.py -DFUBK_BURST_TEST=1 build` (remembered; =0 back): the pattern button then adds 0, +1,
+  -1, +2, -2 deg to the burst instead of changing the pattern.
 
 ### Hardware results (110 ohm series resistor into 75 ohm)
 
 Default build = 20 MHz standard PAL (`FUBK_20MHZ=1`, the others off):
 - Panasonic CRT, reverse-camera monitor, 20-year-old plasma TV: clean, stable colour.
-- RetroScaler 2X: moving line stripes in saturated colours (its own per-line PAL decoder;
-  the CRT does not show them). 41 % / 86 % CPU per core, no underruns.
+- RetroScaler 2X and a 77" OLED TV's AV input: moving Hanover bars in saturated colours until
+  2026-11-08. 41 % / 86 % CPU per core, no underruns.
+  - An Amiga 600 (amigatestkit.adf, 75 % EBU bars) showed only faint ones on the same screens.
+  - The generated samples demodulate to exact PAL (per line, no delay line: hue within 0.9 deg,
+    saturation within 0.8 %), so the error is in the DAC output: the picture chroma about 9 deg
+    late against the burst. PAL-D TVs (CRT, plasma, reverse-camera monitor) hid it in their delay
+    line, but their anti-PAL boxes were not grey.
+  - Fix: the burst is rotated -9.1 deg (sweep with `FUBK_BURST_TEST`: best between -9.5 and
+    -8.4 deg). Then the bars are gone on every screen and the anti-PAL boxes are grey on the
+    plasma and the reverse-camera monitor. NTSC looked right and was left alone.
 - `FUBK20_LINE1281=1` (same phase every line): stripes stand still on the RetroScaler, but the
   subcarrier is +417 Hz off and the plasma's colour flashes on and off. No integer APLL clock
   gives same-phase lines closer to the right frequency (best: 25 MHz, +109 Hz, too much DMA/CPU).
@@ -160,6 +174,32 @@ Default build = 20 MHz standard PAL (`FUBK_20MHZ=1`, the others off):
   the V-switch when you come back to it.
 - `make -C host test20` checks every pattern in both standards (split over 2 states) and a
   switching sequence against the model. `out/preview_*.png` show the pictures.
+
+## Teletext and closed captions (`vbi20.c`)
+
+- **When:** `fubk20_line()` hands blank lines (no picture row) to `vbi20_line()` when
+  `st->vbi_on` is set (the firmware sets it; `fubk20_init` leaves it off, so the exact model
+  tests are unchanged). A data line is drawn into the state's `vbi_buf` and copied into the DMA
+  buffer with `copy_tmpl`, which handles both buffer layouts.
+- **What:** packet n = (2 · frame + field) mod 25, header clock = frame / 25 s. Captions: second
+  = frame · 1001 / 30000; in each second, frames 0–16 send RCL, ENM, PAC row 15, 9 text pairs,
+  EOC (control codes twice), then null pairs. Everything comes from the frame counter, which
+  both render states keep, so they need no shared data.
+- **Teletext waveform:** 6.9375 Mbit/s = 320/111 samples per bit. The first bit starts 10.3 µs
+  after 0H; 0 = blanking, 1 = 462 mV. Each sample is `ttx_lut[phase][5 bits]`: phase = position
+  in the bit in 32 steps, bits k − 2 .. k + 2, raised-cosine pulse with 50 % roll-off.
+  Values −22 to +113 DAC steps around blanking.
+- **Caption waveform:** 32 fH = 1271/32 samples per bit. Run-in: 7 cycles of (1 − cos) from
+  10.5 µs; start bit edge 27.38 µs; 16 bits LSB first; 50 IRE; 400 ns raised-cosine edges.
+- **Cost:** a data line costs about as much as a picture line, and it shares its buffer with a
+  blank line. Measured: worst case 76 % per core (74 % without).
+- **Check:** `make -C host testvbi` renders with and without data and runs
+  `tools/check_vbi20.py`. It slices the lines independently (teletext through a 5 MHz low-pass),
+  checks framing, Hamming, parity, every byte, the header clock and the caption text (a small
+  EIA-608 pop-on decoder), and checks that all other lines are byte-identical. Teletext eye:
+  111 of 144 ns wide, worst bit 183 mV from the threshold. Clock rollover 00:59:59 → 01:00:00 is
+  tested in both standards.
+- **Hardware:** teletext page 100 shows on a real TV. Captions not yet tried on a TV.
 
 ## Front panel and NTSC (20 MHz build)
 

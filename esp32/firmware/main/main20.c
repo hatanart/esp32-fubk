@@ -10,6 +10,7 @@
 //   GPIO15 button to GND ("D15"): next pattern (crosshatch, dots, ...). Not saved: every start
 //          shows the real test card (FuBK / SMPTE bars) first
 //   GPIO12 LED: on in PAL      GPIO13 LED: on in NTSC
+//   Data lines: PAL teletext page P100 (lines 20 + 333), NTSC captions CC1 (line 21); vbi20.c
 //   GPIO18 1 kHz sine as PWM (312.5 kHz, 8 bit; RC low-pass it), updated once per video line,
 //          so it is locked to the picture (PAL: exactly 40 cycles per frame)
 //
@@ -265,6 +266,7 @@ static void start_video(void *arg)
     setup_dma();
     fubk20_init(&st[0], S);
     fubk20_init(&st[1], S);
+    st[0].vbi_on = st[1].vbi_on = 1;               // teletext (PAL) / captions (NTSC)
     fubk20_skip(&st[1]);                           // core 1 starts at buffer 1: skip buffer 0
     fubk20_skip(&st[1]);
     for (int k = 0; k < NBUF; k++)
@@ -405,6 +407,26 @@ static void patterns_init(void)
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 }
 
+#ifdef FUBK_BURST_TEST
+// Test build: the pattern button rotates the PAL burst against the picture, on top of the
+// built-in rotation (make_tables20.py, -9.1 deg); positive = burst phase advanced, 1 step =
+// 360/1024 deg. Presses 0..5 = 0, +1, -1, +2, -2 deg (3 and 6 steps), then 0 again.
+static const int16_t burst_steps[] = { 0, 3, -3, 6, -6 };
+static void burst_set(uint32_t k)
+{
+    int32_t steps = burst_steps[k];
+    uint32_t n = fubk20_pal.car_n;
+    fubk20_burst_ofs = ((uint32_t)(steps + (int32_t)n) % n) * fubk20_pal.car_inv % n;
+    ESP_LOGI(TAG, "burst rotation %+ld steps = %+.1f deg extra", (long)steps, steps * 360.0 / n);
+}
+static void burst_step(void)
+{
+    static uint32_t k;
+    k = (k + 1) % (sizeof burst_steps / sizeof burst_steps[0]);
+    burst_set(k);
+}
+#endif
+
 static void button_task(void *arg)
 {
     uint8_t cur = (uint8_t)(uintptr_t)arg;
@@ -419,8 +441,13 @@ static void button_task(void *arg)
             save_std_and_restart(cur ^ 1);
         // pattern button: one step per press (50 ms down; released for 50 ms before the next)
         if (gpio_get_level(PIN_PATTERN) == 0) {
-            if (plow < 5 && ++plow == 5)
+            if (plow < 5 && ++plow == 5) {
+#ifdef FUBK_BURST_TEST
+                burst_step();
+#else
                 next_pattern();
+#endif
+            }
         } else if (plow >= 5) {
             plow = plow >= 9 ? 0 : plow + 1;
         } else {
@@ -458,6 +485,9 @@ void app_main(void)
         assert(bufs[k]);
     }
     patterns_init();
+#ifdef FUBK_BURST_TEST
+    burst_set(0);
+#endif
     q_core0 = xQueueCreate(NBUF, sizeof(uint32_t));
     xTaskCreatePinnedToCore(core0_worker, "fubk20w", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 0);
     xTaskCreatePinnedToCore(start_video, "video", 4096, NULL, 20, NULL, 1);

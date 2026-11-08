@@ -8,6 +8,7 @@
 // FUBK_I2S16: 16-bit samples, code in the high byte, sample pairs swapped (FUBK_SWAP, default 1).
 #pragma once
 #include <stdint.h>
+#include "vbi20.h"
 
 #ifndef FUBK_SWAP
 #define FUBK_SWAP 1
@@ -39,6 +40,8 @@ typedef struct {
                                          // n + ms; PAL: 2 per colour (+V, -V line)
     uint16_t wlen;
     uint16_t long_period;                // 0 (off); n: every n-th line pair is 1 sample longer per line
+    uint16_t burst_ofs;                  // burst carrier index offset (PAL: rotated, see make_tables20.py)
+    uint8_t vbi;                         // data lines: VBI20_TTX (PAL), VBI20_CC (NTSC)
 } fubk20_std_t;
 
 extern const fubk20_std_t fubk20_pal, fubk20_ntsc;
@@ -54,7 +57,9 @@ typedef struct {
     uint32_t g;                          // line counter mod 2 * long_period (line lengths)
     const fubk20_std_t *pend;            // pattern to switch to at the start of frame pend_frame
     uint32_t pend_frame;
+    uint32_t vbi_on;                     // 1: teletext / captions on (fubk20_init: off)
     uint16_t cur_y[F20_MAX_NB], cur_uv[F20_MAX_NB];
+    uint8_t vbi_buf[F20_MAX_SPL];        // a data line, before it goes to the buffer
 } fubk20_state_t;
 
 void fubk20_init(fubk20_state_t *st, const fubk20_std_t *s);
@@ -64,6 +69,11 @@ static inline uint32_t fubk20_next_len(const fubk20_state_t *st)
     const fubk20_std_t *s = st->s;
     return s->spl + (s->long_period && st->g / 2 == s->long_period - 1u);
 }
+#ifdef FUBK_BURST_TEST
+// PAL burst rotation test: extra burst carrier index offset, (steps * car_inv) % car_n for
+// steps * 360 / car_n degrees on top of the standard's burst_ofs. Set by main20.c.
+extern uint32_t fubk20_burst_ofs;
+#endif
 // render the next line at buf[off .. off + fubk20_next_len() - 1] (fast path for even off)
 void fubk20_line(fubk20_state_t *st, fubk_sample_t *buf, uint32_t off);
 // advance past the next line without rendering it (keeps the block list and phase up to date)

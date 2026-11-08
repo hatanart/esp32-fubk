@@ -22,6 +22,7 @@
 #define N20_NFLAT 8
 #define N20_WLEN 384
 #define N20_LONG_PERIOD 0
+#define N20_BURST_OFS 0
 
 #ifdef FUBK20_TABLES_DATA   // data only in fubk_synth20.c
 static const uint8_t FUBK_TABLE_ATTR n20_tmpl[8897] = {
