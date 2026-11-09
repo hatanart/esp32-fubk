@@ -95,27 +95,43 @@ static VBI_HOT void cc_render(uint32_t frame, uint8_t *out)
 {
     // cells from the start bit: 0 = start (1), 1..16 = data, others 0
     uint32_t bits = 1u | vbi20_cc_pair(frame) << 1;
-    uint32_t u = 0;                                        // position in 1/1271 bit from 10.5 us
-    for (uint32_t i = CC_R; i < CC_I1; i++, u += 32) {
-        uint32_t v;
-        if (u < 7 * 1271) {
-            v = cc_runin[(u % 1271) * 64 / 1271];
-        } else {
-            // y: 1/2542 bit from 4 samples (half an edge) before the start bit's leading edge
-            int32_t y = (int32_t)(2 * u) - 17 * 1271 + 256;
-            if (y < 0) {
-                v = 0;
-            } else {
-                uint32_t c = (uint32_t)y / 2542, g = (uint32_t)y % 2542;
-                uint32_t cur = c < 17 ? (bits >> c) & 1 : 0;
-                uint32_t prev = c > 0 && c <= 17 ? (bits >> (c - 1)) & 1 : 0;
-                if (g < 64 * CC_RAMP && cur != prev)
-                    v = cur ? cc_edge[g >> 6] : CC_A - cc_edge[g >> 6];
-                else
-                    v = cur ? CC_A : 0;
-            }
+    // u: position in 1/1271 bit from 10.5 us, 32 per sample. The run-in index (u % 1271) * 64 /
+    // 1271 and, after it, the cell and the place in it (y / 2542, y % 2542, y = 2 u - 17 * 1271 +
+    // 256) are kept as counters that step per sample: no division per sample (they cost about
+    // a third of the line pair's time).
+    uint32_t u = 0, p = 0, idx = 0, r = 0;                  // p = u % 1271; idx, r: p * 64 / 1271
+    uint32_t i = CC_R;
+    for (; i < CC_I1 && u < 7 * 1271; i++, u += 32) {
+        out[i] = (uint8_t)(BLANK + cc_runin[idx]);
+        p += 32;
+        r += 32 * 64;
+        while (r >= 1271) {
+            r -= 1271;
+            idx++;
         }
+        if (p >= 1271) {
+            p -= 1271;
+            idx -= 64;
+        }
+    }
+    int32_t y = (int32_t)(2 * u) - 17 * 1271 + 256;
+    for (; i < CC_I1 && y < 0; i++, y += 64)
+        out[i] = BLANK;
+    uint32_t c = (uint32_t)y / 2542, g = (uint32_t)y % 2542;   // once
+    for (; i < CC_I1; i++) {
+        uint32_t v;
+        uint32_t cur = c < 17 ? (bits >> c) & 1 : 0;
+        uint32_t prev = c > 0 && c <= 17 ? (bits >> (c - 1)) & 1 : 0;
+        if (g < 64 * CC_RAMP && cur != prev)
+            v = cur ? cc_edge[g >> 6] : CC_A - cc_edge[g >> 6];
+        else
+            v = cur ? CC_A : 0;
         out[i] = (uint8_t)(BLANK + v);
+        g += 64;
+        if (g >= 2542) {
+            g -= 2542;
+            c++;
+        }
     }
 }
 

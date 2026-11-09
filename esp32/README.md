@@ -149,7 +149,7 @@ Default build = 20 MHz standard PAL (`FUBK_20MHZ=1`, the others off):
 
 ## Pattern button (GPIO15)
 
-- `tools/patterns20.py` draws the 13 extra patterns per standard on the same grid as the test
+- `tools/patterns20.py` draws the extra patterns (2..16) on the same grid as the test
   cards. Geometry is in square units (4:3, one unit = one picture row). Rectangles get exact
   area coverage per sample; circles are 4 x 4 supersampled. Luma is shaped for 150 ns edges,
   chroma for 400 ns. PAL line 623 is blanked from 1 us before its half-line equalising pulse.
@@ -163,17 +163,108 @@ Default build = 20 MHz standard PAL (`FUBK_20MHZ=1`, the others off):
   missed the cache everywhere (PAL colour bars: 400 misses for the chroma waveforms), one render
   took up to 270 % of its slot and the I2S interrupt fell more than 16 lines behind (the DMA then
   replays old lines; seen as a 10 kHz dip in the logged sample rate). NTSC circles stayed above
-  100 % peak even when steady. Now the pattern on screen is copied into one heap buffer (the
-  largest pattern, ~50 KB; `fubk20_pattern_load`), and a 1.5 KB RAM copy of the black pattern
-  covers the gap while that buffer is refilled. If the buffer can't be allocated, patterns render
+  100 % peak even when steady. Now the pattern on screen is copied to RAM (a 53 KB buffer plus
+  heap blocks, see the PM5644 section; `fubk20_pattern_load`), and a 1.5 KB RAM copy of the black
+  pattern covers the gap while it is refilled. If the buffer can't be allocated, patterns render
   from flash as before (logged at start).
 - Switching: the button task writes `(slot + 1) << 24 | start frame`, 2 frames ahead (slots:
-  test card, black, RAM copy).
+  built-in card, black, RAM copy).
   `fill()` passes it to its render state (`fubk20_request`), and both states switch at that
   frame start. The frame counter keeps running, so FuBK's anti-PAL A/B frames stay in step with
   the V-switch when you come back to it.
 - `make -C host test20` checks every pattern in both standards (split over 2 states) and a
   switching sequence against the model. `out/preview_*.png` show the pictures.
+
+### Patterns 15 and 16: own line timing
+
+- `PATTERNS` entries carry a kind: `''` (the standard's timing), `'noburst'` (same, burst bit
+  cleared in its own `line_info`) or `'image'`. Patterns with their own timing get their own
+  `line_info` / `rowmap` arrays and line count in `patterns20_tables.h`; `PAT()` takes them.
+  Both are copied to RAM with the pattern.
+- Non-interlaced timing (`PAL_PROG`, `NTSC_PROG` in make_tables20.py): PAL 313 lines (1-2 broad,
+  3 broad + equalising, 4-5 and 311-313 equalising, picture 23..310; 313, not 312: with an even
+  count every line kept its PAL V-switch sign in every field, and the small remaining DAC phase
+  error stood still as Hanover bars on the picture's sky; odd, it flips per field as in 625i), NTSC 262 lines (1-3 and
+  7-9 equalising, 4-6 broad, picture 22..261). To the synth a field is a frame, so the frame
+  counter counts fields there; the V-switch runs on unchanged. Teletext / captions
+  are off (`vbi = 0`); the teletext clock runs twice as fast while the page is shown.
+- Image rendering: palette entry `{y, a, k[2]}`, sample = `(y + a * car[(ms + k[vs]) % N + i]) >> 20`
+  (`a` = A << 6, `k` = hue offset `t * car_inv mod N` for +V / -V lines; the hue is rounded to
+  360/N degrees: PAL 0.35, NTSC 1.0). 8 pixels = 26 samples = 13 pairs per loop step, written
+  straight to the DMA buffer (NTSC odd line starts: single 16-bit stores). `mul16()` forces
+  `mul16s`: GCC otherwise uses the MAC16 accumulator (wsr / mula / rsr per sample).
+- CPU on the image page (2 lines per buffer): PAL avg 56 % / max 62 %, NTSC 60 % / 67 %. Steps
+  on the way (PAL): `U S + V C` per sample 146 % (the output fell to 13 MS/s); hue offset 89 %;
+  mul16s 84 %; direct pair stores instead of a byte line + copy 56 %.
+- RAM: the rows (PAL 288 x 320 = 90 KB) go in 16-row blocks (`img_load` in main20.c), first into
+  `pat_arena` after the pattern's small tables, then into heap blocks, freed at the next pattern
+  load. Rows that find no RAM would stay in flash (logged). Free heap with the PAL picture: 7.7 KB.
+- NTSC field: 262 x 1271 samples would be 59598.36 subcarrier cycles, so the colour pattern
+  moved 0.36 cycle per field (restless on a plasma). Line 262 is 10 samples shorter
+  (`short_line` / `short_by`, used by `fubk20_next_len()` and the model): 332992 samples =
+  59598 cycles, every field identical.
+- PAL field: 313 x 1280 samples would be 88814.25 cycles, so the colour pattern crawled by a
+  quarter cycle per field. Lines 14, 28, .. 308 are 2 samples longer (`ext_every` / `ext_n`; 2,
+  not 1, so every 2-line DMA buffer stays whole 32-bit words): 400684 samples = 88824.0048
+  cycles. The phase accumulator is set back to 0 at every field start (`ph_reset`), so the
+  1.7 deg left over is a step in the vertical sync and fields 2 apart are identical (checked
+  by `check_prog20.py`). On the screens the palm picture became as calm as the NTSC one. The picture's colour is softened before choosing the
+  256 colours (400 ns, as the other patterns): about 35 % less fine chroma.
+- Test option: `idf.py -DFUBK_START_PATTERN=16 build` steps to that pattern at start (for
+  measuring a page over the serial log; remembered, =0 off).
+- Check: `make -C host testprog` (tools/check_prog20.py): sync per line, no half lines, burst
+  lines and phase, every palette colour fitted back from the samples (within 3 mV), and pattern 15
+  = pattern 12 except a blank burst window.
+
+### PM5644 (PAL pattern 1, NTSC pattern 0) and the pattern order
+
+- `tools/pm5644.py` downloads the EPROM dumps (inaxeon/PTV_Preservation, fixed commit, checksum
+  in each file name checked) to `data/ptv_pm5644/` and decodes them: 4 luma + 2 + 2 chroma
+  EPROMs interleaved (128 bytes per row each), video inverted (PAL black 181 / white 41, NTSC
+  170 / 38), per field one record (ctrl, edge, v) per line in the control EPROM: centre row
+  2 v + ctrl bit 0, edge row 2 edge + ctrl bit 1; a line is edge band, centre, edge band on the
+  720-sample BT.601 grid. `patterns20.pm5644()` resamples it to 20 MHz as FuBK (6.2 MHz sinc,
+  1.3 MHz chroma). Rows 2k / 2k + 1 = record k of field 1 / 2 (the interleave with smooth
+  edges); NTSC shows records 1..240 of 243 per field.
+- Each standard has its own order (`patterns20.ORDER`): PAL FuBK, PM5644, extras; NTSC PM5644,
+  SMPTE, extras. In C `F20_PATTERNS(MAIN)` lists them with the built-in card (main tables,
+  always in RAM) at `FUBK20_PAL_MAIN` / `FUBK20_NTSC_MAIN`. NTSC copies PM5644 to RAM at start.
+- RAM: `pat_arena` is 53 KB, allocated before the tasks take their stacks. `fubk20_pattern_load`
+  calls `place(table, bytes)` per table; main20.c puts the set of tables that fills the arena
+  best there (all 2^9 sets tried) and the rest in heap blocks. PM5644 PAL is built without flat
+  colours (90 KB instead of 102): arena uvpool + delta + small tables, ypool (38 KB) on the
+  heap; free heap then 15 KB. With 102 KB, delta did not fit (the largest free block is only
+  49 KB once the tasks run) and stayed in flash. The image page leaves 7.7 KB free, so the
+  heap blocks are freed before the PAL / NTSC switch writes NVS.
+- CPU, PM5644 PAL: avg 49 % / max 81 % (FuBK 40 / 76).
+
+## Card text (PM8503 font) and the edit mode
+
+- `tools/pm8503_font.py` decodes `data/pm8503_charset.png` (an exact 4 x upscale of 12 x 6
+  cells of 9 x 18 dots) into 64 glyphs in edit order (space, A-Z, 0-9, punctuation, accents);
+  glyph 64 is the half space. `make_tables20.py` finds the boxes in the card pictures
+  (`fubk_text_boxes`, `pm5644_text_boxes`) and writes `firmware/main/text20_tables.h`: the font,
+  an edge table and the box positions. Placement: the capitals (dot rows 4..16) are centred in
+  the box, but never higher than keeps the accents (rows 1..16) inside it.
+- A dot is 80/27 samples (2 pixels at 13.5 MHz) wide and 2 frame rows (one per field) high.
+  The edge table holds every sample for each of the 80 sub-positions and each (previous,
+  current, next) dot, with 150 ns edges. Inside the box rows the text is white on the box's
+  black; outside them (or where the box has other content) nothing is drawn. Only FuBK's centre
+  line is covered: a cell that is not a space is drawn opaque over it.
+- The half space in a line's last place shifts the line by 4.5 dots (half a character).
+- Speed: `text_overlay` is `noinline` (inlined, its registers spilled in the render loop). Dots
+  are read 32 at a time and runs of empty dots are skipped with `__builtin_clz`. With every
+  place filled, max CPU is FuBK 85 %, PM5644 PAL 89 %, PM5644 NTSC 94 %; with empty boxes it is
+  as without text.
+- `cc_render` (NTSC captions) was rewritten in the same pass with running counters instead of a
+  division per sample: line 21 is unchanged, byte for byte, and the NTSC peak fell from 116 %
+  (from v1.2 on) to 94 %.
+- Edit mode (`main20.c`): only when both buttons are held at a power-on or reset (not after a
+  software restart). Writing NVS while the video runs triggered the interrupt watchdog, so the
+  save stops I2S, writes the 33-byte blob `text`, sets an `RTC_NOINIT` resume word (magic +
+  cursor position) and restarts; the next boot goes straight back into edit mode.
+- Test: `make -C host testtext` renders FuBK and both PM5644 cards and `tools/check_text20.py`
+  reads the text back from the samples (dot rows on the black box only, not FuBK's centre line).
 
 ## Teletext and closed captions (`vbi20.c`)
 

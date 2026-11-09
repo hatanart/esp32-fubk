@@ -68,14 +68,24 @@ test20: host20_u8 host20_i2s16 host20_test_i2s16
 	cmp ../out/c20_ntsc_u8.u8 ../out/model20_ntsc_2frames.u8 && echo "NTSC, u8: identical to the model"
 	./host20_i2s16 ../out/c20_ntsc_split.u8 2 1 1
 	cmp ../out/c20_ntsc_split.u8 ../out/model20_ntsc_2frames.u8 && echo "NTSC, I2S16, split over 2 states: identical to the model"
-	@for k in 01 02 03 04 05 06 07 08 09 10 11 12 13; do \
+	@for k in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16; do \
 	  ./host20_i2s16 ../out/c20_pal_pat$$k.u8 1 1 0 $$k && cmp ../out/c20_pal_pat$$k.u8 ../out/model20_pal_pat$$k.u8 && \
 	  ./host20_i2s16 ../out/c20_ntsc_pat$$k.u8 1 1 1 $$k && cmp ../out/c20_ntsc_pat$$k.u8 ../out/model20_ntsc_pat$$k.u8 || exit 1; \
-	done 2>/dev/null; echo "patterns 1-13, PAL + NTSC, split: identical to the model"
-	./host20_i2s16 ../out/c20_pal_switch.u8 5 1 0 0,1,4,7,0
+	done 2>/dev/null; ./host20_i2s16 ../out/c20_ntsc_pat00.u8 1 1 1 0 2>/dev/null && \
+	  cmp ../out/c20_ntsc_pat00.u8 ../out/model20_ntsc_pat00.u8 && \
+	  echo "patterns 0-16, PAL + NTSC (PAL 1 + NTSC 0 = PM5644), split: identical to the model"
+	./host20_i2s16 ../out/c20_pal_switch.u8 5 1 0 0,2,5,8,0
 	cmp ../out/c20_pal_switch.u8 ../out/model20_pal_switch.u8 && echo "PAL pattern switching (FuBK, crosshatch, bars, red, FuBK): identical to the model"
-	./host20_u8 ../out/c20_ntsc_switch.u8 4 0 1 0,4,8,0
+	./host20_u8 ../out/c20_ntsc_switch.u8 4 0 1 1,5,9,1
 	cmp ../out/c20_ntsc_switch.u8 ../out/model20_ntsc_switch.u8 && echo "NTSC pattern switching (SMPTE, bars, green, SMPTE): identical to the model"
+	./host20_i2s16 ../out/c20_pal_switch_prog.u8 6 1 0 0,16,16,16,15,0
+	cmp ../out/c20_pal_switch_prog.u8 ../out/model20_pal_switch_prog.u8 && echo "PAL FuBK -> 313-line image page -> multiburst without burst -> FuBK: identical to the model"
+	./host20_i2s16 ../out/c20_ntsc_switch_prog.u8 6 1 1 1,16,16,16,15,1
+	cmp ../out/c20_ntsc_switch_prog.u8 ../out/model20_ntsc_switch_prog.u8 && echo "NTSC SMPTE -> 262-line image page -> multiburst without burst -> SMPTE: identical to the model"
+	./host20_i2s16 ../out/c20_pal_switch_pm.u8 4 1 0 0,1,1,0
+	cmp ../out/c20_pal_switch_pm.u8 ../out/model20_pal_switch_pm.u8 && echo "PAL FuBK -> PM5644 -> FuBK: identical to the model"
+	./host20_u8 ../out/c20_ntsc_switch_pm.u8 4 0 1 0,1,1,0
+	cmp ../out/c20_ntsc_switch_pm.u8 ../out/model20_ntsc_switch_pm.u8 && echo "NTSC PM5644 -> SMPTE -> PM5644: identical to the model"
 
 # Data lines (teletext / captions): decoded back by tools/check_vbi20.py; all other lines must be
 # unchanged. Includes the clock rollover 00:59:59 -> 01:00:00.
@@ -96,3 +106,21 @@ clean20:
 
 clean:
 	rm -f $(BINS) ../out/c_*.u8
+
+# New pages (v1.3): the non-interlaced 256-colour image page (sync, burst and every palette colour
+# decoded back by tools/check_prog20.py) and the multiburst without colour burst.
+testprog: host20_i2s16
+	./host20_i2s16 ../out/p16_pal.u8 3 1 0 16 && $(PY) ../tools/check_prog20.py pal ../out/p16_pal.u8
+	./host20_i2s16 ../out/p16_ntsc.u8 3 1 1 16 && $(PY) ../tools/check_prog20.py ntsc ../out/p16_ntsc.u8
+	./host20_i2s16 ../out/p15_pal.u8 2 1 0 15 && ./host20_i2s16 ../out/p12_pal.u8 2 1 0 12
+	$(PY) ../tools/check_prog20.py pal --noburst ../out/p15_pal.u8 ../out/p12_pal.u8
+	./host20_i2s16 ../out/p15_ntsc.u8 2 1 1 15 && ./host20_i2s16 ../out/p12_ntsc.u8 2 1 1 12
+	$(PY) ../tools/check_prog20.py ntsc --noburst ../out/p15_ntsc.u8 ../out/p12_ntsc.u8
+	rm -f ../out/p1[256]_*.u8
+
+# Text in the test cards (v1.4): read back from the output by tools/check_text20.py
+testtext: host20_i2s16
+	./host20_i2s16 ../out/t_fubk.u8 1 1 0 0 && $(PY) ../tools/check_text20.py fubk ../out/t_fubk.u8
+	./host20_i2s16 ../out/t_pm_pal.u8 1 1 0 1 && $(PY) ../tools/check_text20.py pm5644-pal ../out/t_pm_pal.u8
+	./host20_i2s16 ../out/t_pm_ntsc.u8 1 1 1 0 && $(PY) ../tools/check_text20.py pm5644-ntsc ../out/t_pm_ntsc.u8
+	rm -f ../out/t_*.u8

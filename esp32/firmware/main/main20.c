@@ -1,5 +1,5 @@
 // PAL / NTSC test pattern generator at 20 MS/s on the ESP32 internal DAC (GPIO25), ESP-IDF v5.x.
-//   PAL : FuBK test card          NTSC: SMPTE colour bars
+//   PAL : FuBK test card          NTSC: Philips PM5644 (then SMPTE colour bars)
 //
 // The APLL runs at 80 MHz with integer coefficients only (sdm0 = sdm1 = 0, sdm2 = 8, odiv = 1),
 // so there is no sigma-delta clock jitter; I2S sends APLL / 4 = 20 MS/s. The subcarrier is
@@ -7,8 +7,8 @@
 //
 // Front panel (like the earlier box):
 //   GPIO4  button to GND ("D4"): toggles PAL / NTSC (saved in NVS, then restart)
-//   GPIO15 button to GND ("D15"): next pattern (crosshatch, dots, ...). Not saved: every start
-//          shows the real test card (FuBK / SMPTE bars) first
+//   GPIO15 button to GND ("D15"): next pattern (PAL: PM5644; NTSC: SMPTE bars; then crosshatch,
+//          dots, ...). Not saved: every start shows pattern 0 (PAL FuBK, NTSC PM5644)
 //   GPIO12 LED: on in PAL      GPIO13 LED: on in NTSC
 //   Data lines: PAL teletext page P100 (lines 20 + 333), NTSC captions CC1 (line 21); vbi20.c
 //   GPIO18 1 kHz sine as PWM (312.5 kHz, 8 bit; RC low-pass it), updated once per video line,
@@ -51,6 +51,7 @@
 #include "rom/lldesc.h"
 #include "driver/dac.h"
 #include "fubk_synth20.h"
+#include "text20_tables.h"                 // FUBK20_NGLYPH (the font's data is in fubk_synth20.c)
 
 static const char *TAG = "fubk20";
 
@@ -71,14 +72,26 @@ static QueueHandle_t q_core0;
 static fubk20_state_t st[2];               // st[w] renders the buffers k with k % 2 == w
 static const fubk20_std_t *S;              // the standard (timing); pattern 0 = its test card
 static const fubk20_std_t *PATS;           // its patterns
+static const fubk20_std_t *start_std;      // pattern 0 (PAL FuBK, NTSC PM5644 in RAM)
 // Patterns: 0 is the test card (tables in RAM). The extra ones are in flash; the one on screen is
 // copied to pat_ram first, because rendering from flash stalls on cache misses (up to 270 % of a
 // buffer's time right after a switch). While pat_ram is refilled, the screen shows black from
 // its own small RAM copy.
 enum { SLOT_CARD, SLOT_BLACK, SLOT_RAM };
-#define PAT_BLACK 10                       // "black" in patterns20.py
+static uint32_t main_k;                    // position of the built-in card (PAL 0, NTSC 1)
 static fubk20_std_t pat_ram, black_ram;
+// RAM for the pattern on screen: pat_arena (ARENA_BYTES, allocated at start before the tasks
+// take their stacks), then heap blocks for what does not fit. The tables that fill pat_arena
+// best go there (PM5644 PAL, 90 KB: uvpool + delta + small ones, ypool on the heap); image rows
+// (the image page: 90 KB) go in blocks of 16 rows, so no large free block is needed. The heap
+// blocks are freed when the next pattern is loaded.
+#define ARENA_BYTES (53 * 1024)
+#define IMG_CHUNK_ROWS 16
 static void *pat_arena;
+static uint32_t arena_size, arena_used, arena_mask;     // mask: tables that go to pat_arena
+static void *heap_blk[32];
+static uint32_t n_heap_blk;
+static const uint8_t *img_rows_ram[FUBK20_IMG_MAX_ROWS];
 static const fubk20_std_t *slot_std[3];
 // pattern request from the button task: (slot + 1) << 24 | frame (low 24 bits) it starts at;
 // 0 = none. fill() hands it to both render states, which switch at that frame start.
@@ -136,7 +149,7 @@ static IRAM_ATTR void fill(uint32_t k)
         uint32_t frame = s->frame + (((r & 0xFFFFFFu) - s->frame) & 0xFFFFFFu);
         fubk20_request(s, slot_std[(r >> 24) - 1], frame);
     }
-    // line lengths: PAL always 1280; NTSC 1271 + 1271, or 1272 + 1272 for every 9th pair. The
+    // line lengths: PAL 1280 (image page: some 1282); NTSC 1271 + 1271, or 1272 + 1272 for every 9th pair. The
     // DMA reaches this buffer only after the other NBUF - 1, so its descriptors can change here.
     uint32_t n1 = fubk20_next_len(s);
     fubk20_line(s, bufs[k], 0);
@@ -264,8 +277,8 @@ static void start_video(void *arg)
     I2S0.fifo_conf.tx_data_num = 48;
 
     setup_dma();
-    fubk20_init(&st[0], S);
-    fubk20_init(&st[1], S);
+    fubk20_init(&st[0], start_std);
+    fubk20_init(&st[1], start_std);
     st[0].vbi_on = st[1].vbi_on = 1;               // teletext (PAL) / captions (NTSC)
     fubk20_skip(&st[1]);                           // core 1 starts at buffer 1: skip buffer 0
     fubk20_skip(&st[1]);
@@ -320,12 +333,15 @@ static uint8_t load_std(void)
     return v ? 1 : 0;
 }
 
+static void heap_free(void);
+
 static void save_std_and_restart(uint8_t v)
 {
     // stop the video first: no interrupt or DMA while the flash is written
     esp_intr_disable(isr_handle);
     I2S0.conf.tx_start = 0;
     I2S0.out_link.stop = 1;
+    heap_free();                                   // the image page leaves little heap for NVS
     nvs_handle_t h;
     if (nvs_open("fubk", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, "std", v);
@@ -355,15 +371,106 @@ static bool ram_in_use(void)
     return false;
 }
 
+// fubk20_place_t for one known-size block: *ctx is the next free byte
+static void *bump(uint32_t table, uint32_t bytes, void *ctx)
+{
+    (void)table;
+    uint8_t **p = ctx, *m = *p;
+    *p += bytes;
+    return m;
+}
+
+static void heap_free(void)
+{
+    while (n_heap_blk)
+        heap_caps_free(heap_blk[--n_heap_blk]);
+    arena_used = 0;
+}
+
+// fubk20_place_t: pat_arena for the tables in arena_mask (and image rows while it has room),
+// else a heap block (0 if none)
+static void *place(uint32_t table, uint32_t bytes, void *ctx)
+{
+    (void)ctx;
+    bool arena = table >= FUBK20_NTABLES || (arena_mask >> table & 1);
+    if (arena && pat_arena && arena_used + bytes <= arena_size) {
+        void *m = (uint8_t *)pat_arena + arena_used;
+        arena_used += bytes;
+        return m;
+    }
+    if (n_heap_blk == sizeof heap_blk / sizeof heap_blk[0])
+        return NULL;
+    void *m = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (m)
+        heap_blk[n_heap_blk++] = m;
+    return m;
+}
+
+// copy the rows of image page src to RAM (blocks of 16 rows from place()) and point pat_ram to
+// them; rows that find no RAM stay in flash (slower). Returns the rows left in flash.
+static uint32_t img_load(const fubk20_std_t *src)
+{
+    uint8_t *p = NULL, *end = NULL;
+    uint32_t in_flash = 0;
+    for (uint32_t r = 0; r < src->rows; r++) {
+        if (!p || p + FUBK20_IMG_W > end) {
+            uint32_t n = src->rows - r < IMG_CHUNK_ROWS ? src->rows - r : IMG_CHUNK_ROWS;
+            p = place(FUBK20_NTABLES, n * FUBK20_IMG_W, NULL);
+            end = p ? p + n * FUBK20_IMG_W : NULL;
+        }
+        if (p) {
+            memcpy(p, src->img_rows[r], FUBK20_IMG_W);
+            img_rows_ram[r] = p;
+            p += FUBK20_IMG_W;
+        } else {
+            img_rows_ram[r] = src->img_rows[r];
+            in_flash++;
+        }
+    }
+    pat_ram.img_rows = img_rows_ram;
+    return in_flash;
+}
+
+// copy pattern k to pat_ram (nothing may render from it now); logs what went where
+static void load_ram(uint32_t k)
+{
+    int64_t t0 = esp_timer_get_time();
+    heap_free();
+    // the tables that fill pat_arena best (all 2^9 sets; most patterns fit completely)
+    uint32_t sz[FUBK20_NTABLES], best = 0;
+    fubk20_pattern_tables(PATS, k, sz);
+    arena_mask = 0;
+    for (uint32_t m = 1; m < 1u << FUBK20_NTABLES; m++) {
+        uint32_t t = 0;
+        for (int i = 0; i < FUBK20_NTABLES; i++)
+            if (m >> i & 1)
+                t += sz[i];
+        if (t <= arena_size && t > best) {
+            best = t;
+            arena_mask = m;
+        }
+    }
+    uint32_t fl = fubk20_pattern_load(PATS, k, place, NULL, &pat_ram);
+    if (pat_ram.img_rows)
+        fl += img_load(&PATS[k]) * FUBK20_IMG_W;
+    int64_t t1 = esp_timer_get_time();
+    ESP_LOGI(TAG, "pattern %lu: %s, copied to RAM in %lld us (%lu bytes in pattern RAM, %lu heap blocks, "
+             "%lu bytes left in flash); free internal heap %lu, largest block %lu", (unsigned long)k,
+             PATS[k].name, (long long)(t1 - t0), (unsigned long)arena_used, (unsigned long)n_heap_blk,
+             (unsigned long)fl, (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+}
+
+static uint32_t cur_pat;
+
 static void next_pattern(void)
 {
-    static uint32_t pat;
-    pat = (pat + 1) % FUBK20_NPAT;
-    if (pat == 0 || !pat_arena) {
-        // test card (RAM already); or no RAM buffer: render straight from flash
-        if (!pat_arena)
+    uint32_t pat = cur_pat = (cur_pat + 1) % FUBK20_NPAT;
+    if (pat == main_k || !pat_arena) {
+        // built-in card (RAM already); or no RAM buffer: render straight from flash
+        if (pat != main_k)
             slot_std[SLOT_RAM] = &PATS[pat];
-        request_slot(pat == 0 ? SLOT_CARD : SLOT_RAM);
+        request_slot(pat == main_k ? SLOT_CARD : SLOT_RAM);
         ESP_LOGI(TAG, "pattern %lu: %s", (unsigned long)pat, PATS[pat].name);
         return;
     }
@@ -376,35 +483,42 @@ static void next_pattern(void)
             return;
         }
     }
-    int64_t t0 = esp_timer_get_time();
-    fubk20_pattern_load(PATS, pat, pat_arena, &pat_ram);
-    int64_t t1 = esp_timer_get_time();
+    load_ram(pat);
     request_slot(SLOT_RAM);
-    ESP_LOGI(TAG, "pattern %lu: %s (%lu bytes copied to RAM in %lld us)", (unsigned long)pat,
-             PATS[pat].name, (unsigned long)fubk20_pattern_bytes(PATS, pat), (long long)(t1 - t0));
 }
 
-static void patterns_init(void)
+// before the video starts: pattern RAM, the black pattern, and the start pattern start_k (copied
+// to RAM unless it is the built-in card). Returns it.
+static const fubk20_std_t *patterns_init(uint8_t ntsc, uint32_t start_k)
 {
+    cur_pat = start_k;
+    main_k = ntsc ? FUBK20_NTSC_MAIN : FUBK20_PAL_MAIN;
     slot_std[SLOT_CARD] = S;
-    slot_std[SLOT_BLACK] = &PATS[0];               // fallback: never used if black_ram loads
-    uint32_t mx = 0;
-    for (uint32_t k = 1; k < FUBK20_NPAT; k++) {
-        uint32_t n = fubk20_pattern_bytes(PATS, k);
-        if (n > mx)
-            mx = n;
-    }
-    assert(strstr(PATS[PAT_BLACK].name, "black"));
-    void *b = heap_caps_malloc(fubk20_pattern_bytes(PATS, PAT_BLACK), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    slot_std[SLOT_BLACK] = S;                      // fallback: never used if black_ram loads
+    uint32_t mx = ARENA_BYTES, kb = 0;
+    for (uint32_t k = 0; k < FUBK20_NPAT; k++)
+        if (strstr(PATS[k].name, " black"))
+            kb = k;
+    assert(kb);
+    void *b = heap_caps_malloc(fubk20_pattern_bytes(PATS, kb), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     pat_arena = heap_caps_malloc(mx, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    arena_size = pat_arena ? mx : 0;
     if (b) {
-        fubk20_pattern_load(PATS, PAT_BLACK, b, &black_ram);
+        uint8_t *bp = b;
+        fubk20_pattern_load(PATS, kb, bump, &bp, &black_ram);
         slot_std[SLOT_BLACK] = &black_ram;
     }
     slot_std[SLOT_RAM] = &pat_ram;
-    ESP_LOGI(TAG, "pattern RAM: %lu bytes %s; free internal heap %lu bytes", (unsigned long)mx,
-             pat_arena ? "allocated" : "NOT available (patterns render from flash)",
-             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    ESP_LOGI(TAG, "pattern RAM: %lu bytes %s; free internal heap %lu bytes, largest block %lu",
+             (unsigned long)mx, pat_arena ? "allocated" : "NOT available (patterns render from flash)",
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (start_k == main_k)
+        return S;
+    if (!pat_arena)
+        return &PATS[start_k];
+    load_ram(start_k);
+    return &pat_ram;
 }
 
 #ifdef FUBK_BURST_TEST
@@ -433,26 +547,184 @@ static void button_task(void *arg)
     // wait until the buttons are released (they may be held at power-up)
     while (gpio_get_level(PIN_BUTTON) == 0 || gpio_get_level(PIN_PATTERN) == 0)
         vTaskDelay(pdMS_TO_TICKS(20));
-    int low = 0, plow = 0;
+#ifdef FUBK_START_PATTERN
+    vTaskDelay(pdMS_TO_TICKS(500));                // test builds: step to this pattern at start
+    for (int i = 0; i < FUBK_START_PATTERN; i++)
+        next_pattern();
+#endif
+    // each button acts when it is released (50 ms down, then 50 ms up: debounced), and only if
+    // the other one was not pressed meanwhile: both together do nothing in normal use (the edit
+    // mode is only entered by holding both at power-on)
+    uint32_t da = 0, ua = 0, db = 0, ub = 0;
+    bool pa = false, pb = false, both = false;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(10));
-        low = gpio_get_level(PIN_BUTTON) == 0 ? low + 1 : 0;
-        if (low == 5)                              // 50 ms pressed: debounced
-            save_std_and_restart(cur ^ 1);
-        // pattern button: one step per press (50 ms down; released for 50 ms before the next)
-        if (gpio_get_level(PIN_PATTERN) == 0) {
-            if (plow < 5 && ++plow == 5) {
+        bool a = gpio_get_level(PIN_PATTERN) == 0, b = gpio_get_level(PIN_BUTTON) == 0;
+        da = a ? da + 1 : 0;
+        ua = a ? 0 : ua + 1;
+        db = b ? db + 1 : 0;
+        ub = b ? 0 : ub + 1;
+        if (da >= 5)
+            pa = true;
+        if (db >= 5)
+            pb = true;
+        if (pa && pb)
+            both = true;
+        if (pa && ua >= 5) {                       // pattern button released
+            pa = false;
+            if (!both) {
 #ifdef FUBK_BURST_TEST
                 burst_step();
 #else
                 next_pattern();
 #endif
             }
-        } else if (plow >= 5) {
-            plow = plow >= 9 ? 0 : plow + 1;
-        } else {
-            plow = 0;
         }
+        if (pb && ub >= 5) {                       // PAL/NTSC button released
+            pb = false;
+            if (!both)
+                save_std_and_restart(cur ^ 1);
+        }
+        if (!pa && !pb)
+            both = false;
+    }
+}
+
+// --- text (PM5644 boxes, FuBK name box) and the text edit mode ----------------------------------
+// 33 positions: 0..7 PM5644 upper, 8..19 PM5644 lower, 20..32 FuBK. The edit mode edits the card
+// it starts on (pattern 0): in PAL FuBK (20..32), in NTSC PM5644 (0..19; PAL's PM5644 shows
+// the same text). Saved in NVS as blob "text" (glyph indices); without it the defaults from
+// text20_tables.h stay.
+#define TEXT_POS 33
+#define TEXT_POS_FUBK 20
+
+static uint8_t *text_at(uint32_t p)
+{
+    return p < 8 ? &fubk20_text[0][p] : p < 20 ? &fubk20_text[1][p - 8] : &fubk20_text[2][p - 20];
+}
+
+static void text_load(void)
+{
+    uint8_t t[TEXT_POS];
+    size_t n = sizeof t;
+    nvs_handle_t h;
+    if (nvs_open("fubk", NVS_READONLY, &h) != ESP_OK)
+        return;
+    if (nvs_get_blob(h, "text", t, &n) == ESP_OK && n == sizeof t) {
+        for (uint32_t p = 0; p < TEXT_POS; p++)
+            *text_at(p) = t[p] < FUBK20_NGLYPH ? t[p] : 0;
+        ESP_LOGI(TAG, "text loaded from flash (glyphs %u %u %u ...)", t[0], t[1], t[2]);
+    }
+    nvs_close(h);
+}
+
+static void text_save(void)
+{
+    uint8_t t[TEXT_POS];
+    for (uint32_t p = 0; p < TEXT_POS; p++)
+        t[p] = *text_at(p);
+    nvs_handle_t h;
+    if (nvs_open("fubk", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_blob(h, "text", t, sizeof t);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGI(TAG, "text saved");
+}
+
+// Saving the text writes the flash, which must not happen while the video runs (the interrupt
+// watchdog resets the chip): the video stops, the text is saved, and the chip restarts straight
+// into edit mode at the same position (edit_resume survives the restart).
+#define EDIT_MAGIC 0xED170000u
+static RTC_NOINIT_ATTR uint32_t edit_resume;
+
+static void edit_save_and_restart(uint32_t pos)
+{
+    esp_intr_disable(isr_handle);
+    I2S0.conf.tx_start = 0;
+    I2S0.out_link.stop = 1;
+    heap_free();
+    text_save();
+    edit_resume = EDIT_MAGIC | pos;
+    vTaskDelay(pdMS_TO_TICKS(20));
+    esp_restart();
+}
+
+// Edit mode (both buttons held at power-on): pattern 0 (PAL FuBK, NTSC PM5644) with a blinking
+// cursor. After the last character comes the half space (only in a line's last place: moves the
+// line half a character right, to centre it). Pattern button: next
+// character, PAL/NTSC button: previous one (on release; held: repeats after 0.5 s, 8 per
+// second); both together: next position (on release), both held 1 s: previous position. 3 s
+// after the last change the text is saved (the picture blinks: see above), so switching off
+// after that keeps it.
+static void edit_task(void *arg)
+{
+    while (gpio_get_level(PIN_BUTTON) == 0 || gpio_get_level(PIN_PATTERN) == 0)
+        vTaskDelay(pdMS_TO_TICKS(20));             // the power-on press
+    // PAL: FuBK's 13 positions, NTSC: PM5644's 20
+    const uint32_t first = S == &fubk20_pal ? TEXT_POS_FUBK : 0;
+    const uint32_t npos = S == &fubk20_pal ? TEXT_POS - TEXT_POS_FUBK : TEXT_POS_FUBK;
+    uint32_t pos = (uint32_t)(uintptr_t)arg, da = 0, db = 0, held = 0, tick = 0, quiet = 0, ct = 0;
+    if (pos < first || pos >= first + npos)
+        pos = first;
+    bool active = false, chord = false, rep = false, dirty = false;
+    int dir = 0;
+    fubk20_cursor = (int8_t)pos;
+    for (;; tick++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        if (tick % 25 == 0)
+            fubk20_cursor_on ^= 1;                 // 2 Hz blink
+        da = gpio_get_level(PIN_PATTERN) == 0 ? da + 1 : 0;
+        db = gpio_get_level(PIN_BUTTON) == 0 ? db + 1 : 0;
+        bool a = da >= 3, b = db >= 3;             // 30 ms: debounced
+        int step = 0;
+        if (!active && (a || b)) {
+            active = true;
+            chord = rep = false;
+            held = 0;
+        }
+        int move = 0;
+        if (active) {
+            if (a && b && !chord) {                // both: a position move (decided below)
+                chord = true;
+                ct = 0;
+            }
+            if (chord && ++ct == 100)              // both held 1 s: previous position
+                move = -1;
+            if (!chord && (a != b)) {
+                dir = a ? 1 : -1;
+                if (++held >= 50 && (held - 50) % 12 == 0) {
+                    step = dir;
+                    rep = true;
+                }
+            }
+            if (!a && !b) {
+                if (!chord && !rep)
+                    step = dir;
+                if (chord && ct < 100)             // short double press: next position
+                    move = 1;
+                active = false;
+            }
+        }
+        if (move) {
+            pos = first + (pos - first + npos + (uint32_t)move) % npos;
+            fubk20_cursor = (int8_t)pos;
+            fubk20_cursor_on = 1;
+            tick = 1;
+        }
+        if (step) {
+            uint8_t *g = text_at(pos);
+            *g = (uint8_t)((*g + FUBK20_NGLYPH + step) % FUBK20_NGLYPH);
+            // the half space only in a line's last place (7, 19, 32)
+            if (*g == FUBK20_HALF && pos != 7 && pos != 19 && pos != TEXT_POS - 1)
+                *g = (uint8_t)((*g + FUBK20_NGLYPH + step) % FUBK20_NGLYPH);
+            fubk20_cursor_on = 1;                  // show the new character at once
+            tick = 1;
+            dirty = true;
+            quiet = 0;
+        }
+        if (dirty && !active && ++quiet >= 300)    // 3 s without a change
+            edit_save_and_restart(pos);
     }
 }
 
@@ -478,20 +750,37 @@ void app_main(void)
     PATS = ntsc ? fubk20_ntsc_pat : fubk20_pal_pat;
     gpio_init(ntsc);
     audio_init();
+    text_load();
+    vTaskDelay(pdMS_TO_TICKS(20));                 // pull-ups settled
+    // edit mode: both buttons held at power-on (or a reset with the EN button), not after the
+    // firmware's own restarts (the PAL / NTSC switch); or the restart after an edit-mode save
+    uint32_t resume = edit_resume;
+    edit_resume = 0;
+    esp_reset_reason_t why = esp_reset_reason();
+    bool resumed = why == ESP_RST_SW && (resume & 0xFFFF0000u) == EDIT_MAGIC && (resume & 0xFFu) < TEXT_POS;
+    bool edit = resumed || (why != ESP_RST_SW && gpio_get_level(PIN_BUTTON) == 0 &&
+                            gpio_get_level(PIN_PATTERN) == 0);
 
     for (int k = 0; k < NBUF; k++) {
         bufs[k] = heap_caps_aligned_alloc(4, (2 * F20_MAX_SPL + 4) * sizeof(uint16_t),
                                           MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
         assert(bufs[k]);
     }
-    patterns_init();
+    start_std = patterns_init(ntsc, 0);           // pattern 0 (the edit mode edits its text)
+    if (edit)
+        ESP_LOGI(TAG, "text edit mode: pattern button = next character, PAL/NTSC button = previous, "
+                 "both = next position (held 1 s: previous); saved 3 s after a change. PAL: FuBK's "
+                 "text, NTSC: PM5644's");
 #ifdef FUBK_BURST_TEST
     burst_set(0);
 #endif
     q_core0 = xQueueCreate(NBUF, sizeof(uint32_t));
     xTaskCreatePinnedToCore(core0_worker, "fubk20w", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 0);
     xTaskCreatePinnedToCore(start_video, "video", 4096, NULL, 20, NULL, 1);
-    xTaskCreatePinnedToCore(button_task, "button", 3072, (void *)(uintptr_t)ntsc, 5, NULL, 0);
+    if (edit)
+        xTaskCreatePinnedToCore(edit_task, "edit", 3072, (void *)(uintptr_t)(resumed ? resume & 0xFFu : 0u), 5, NULL, 0);
+    else
+        xTaskCreatePinnedToCore(button_task, "button", 3072, (void *)(uintptr_t)ntsc, 5, NULL, 0);
 
     uint32_t cpu_hz = 0;
     esp_clk_tree_src_get_freq_hz(SOC_MOD_CLK_CPU, ESP_CLK_TREE_SRC_FREQ_PRECISION_CACHED, &cpu_hz);

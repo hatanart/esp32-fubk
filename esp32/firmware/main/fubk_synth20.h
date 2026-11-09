@@ -21,8 +21,34 @@ typedef uint8_t fubk_sample_t;
 #endif
 
 #define F20_MAX_NB 34                    // blocks of 32 samples per line (NTSC 34, PAL 33)
-#define F20_MAX_SPL 1280                 // longest line (NTSC long lines: 1272)
-#define FUBK20_NPAT 14                   // patterns per standard: 0 = FuBK / SMPTE, 1.. extra
+#define F20_MAX_SPL 1282                 // longest line (PAL image page long lines: 1282)
+#define FUBK20_NPAT 17                   // patterns per standard (the pattern button's list)
+#define FUBK20_PAL_MAIN 0                // position of the built-in card: PAL 0 = FuBK (1 = PM5644),
+#define FUBK20_NTSC_MAIN 1               // NTSC 1 = SMPTE bars (0 = PM5644)
+#define FUBK20_IMG_W 320                 // image pages: pixels per line (4 pixels = 13 samples)
+#define FUBK20_IMG_MAX_ROWS 288          // image pages: rows (PAL 288, NTSC 240)
+
+// Text in the test cards (PM5644 upper / lower box, FuBK name box): a line of n PM8503
+// characters (9 x 18 dots, a dot = 80/27 samples x 2 frame rows) from data row row0 on, starting
+// at sample x0 (nsamp samples incl. the edges), showing text line `text`: 0 = PM5644 upper
+// (8 characters), 1 = PM5644 lower (12), 2 = FuBK (13).
+#define FUBK20_TEXT_MAX 13               // characters per text line
+#define FUBK20_NTEXTS 3
+// Only rows ylo..yhi (the box) are drawn. Samples cx0..cx1 - 1, where the box is not black (FuBK:
+// the centre line), are covered by a character's whole cell; elsewhere only the letters are
+// drawn. A half space (FUBK20_HALF) in the last place moves the line half a character right.
+typedef struct { uint16_t row0, x0, nsamp, ylo, yhi, cx0, cx1; uint8_t n, text; } fubk20_textbox_t;
+// the text (glyph indices, see text20_tables.h), the same in both standards; the edit mode's
+// cursor (-1 = none, else a position: 0..7 upper, 8..19 lower, 20..32 FuBK) is drawn inverted
+// while fubk20_cursor_on is set
+extern uint8_t fubk20_text[FUBK20_NTEXTS][FUBK20_TEXT_MAX];
+extern volatile int8_t fubk20_cursor;
+extern volatile uint8_t fubk20_cursor_on;
+
+// image page palette entry: sample = (y + a * car[(ms + k[vs]) % car_n + i]) >> 20, i.e.
+// Y + A sin(carrier + hue): y = (Y + blanking) << 20 with the rounding, a = A << 6, k = the
+// carrier table offset for the hue on +V / -V lines (make_tables20.py, palette_entries)
+typedef struct { int32_t y; int16_t a; uint16_t k[2]; } fubk20_pal_t;
 
 typedef struct {
     const char *name;
@@ -41,7 +67,18 @@ typedef struct {
     uint16_t wlen;
     uint16_t long_period;                // 0 (off); n: every n-th line pair is 1 sample longer per line
     uint16_t burst_ofs;                  // burst carrier index offset (PAL: rotated, see make_tables20.py)
-    uint8_t vbi;                         // data lines: VBI20_TTX (PAL), VBI20_CC (NTSC)
+    uint8_t vbi;                         // data lines: VBI20_TTX (PAL), VBI20_CC (NTSC), 0 = none
+    // image pages (non-interlaced 256 colours), else 0: per row its FUBK20_IMG_W palette indices
+    const uint8_t *const *img_rows;
+    const fubk20_pal_t *img_pal;
+    uint16_t img_x0;                     // sample of the first pixel
+    uint16_t short_line;                 // this line is short_by samples shorter (0 = none; the
+    uint8_t short_by;                    // NTSC non-interlaced page: whole subcarrier cycles per field)
+    uint8_t ext_every, ext_n;            // lines ext_every, 2 ext_every, .. ext_n ext_every are 2
+                                         // samples longer (0 = none; PAL non-interlaced page)
+    uint8_t ph_reset;                    // subcarrier phase back to 0 at every field start
+    const fubk20_textbox_t *text;        // text lines on this card (in RAM), ntext of them
+    uint8_t ntext, txt_black;            // txt_black: black level of its text boxes (DAC steps)
 } fubk20_std_t;
 
 extern const fubk20_std_t fubk20_pal, fubk20_ntsc;
@@ -67,7 +104,9 @@ void fubk20_init(fubk20_state_t *st, const fubk20_std_t *s);
 static inline uint32_t fubk20_next_len(const fubk20_state_t *st)
 {
     const fubk20_std_t *s = st->s;
-    return s->spl + (s->long_period && st->g / 2 == s->long_period - 1u);
+    return s->spl + (s->long_period && st->g / 2 == s->long_period - 1u)
+         - (st->line == s->short_line ? s->short_by : 0u)
+         + 2u * (s->ext_every && st->line % s->ext_every == 0 && st->line / s->ext_every <= s->ext_n);
 }
 #ifdef FUBK_BURST_TEST
 // PAL burst rotation test: extra burst carrier index offset, (steps * car_inv) % car_n for
@@ -78,12 +117,23 @@ extern uint32_t fubk20_burst_ofs;
 void fubk20_line(fubk20_state_t *st, fubk_sample_t *buf, uint32_t off);
 // advance past the next line without rendering it (keeps the block list and phase up to date)
 void fubk20_skip(fubk20_state_t *st);
-// The extra patterns live in flash. Rendering from flash costs cache misses (worst right after a
-// switch), so the firmware copies the pattern it shows into RAM: fubk20_pattern_bytes() is the
-// RAM it needs (0 for pattern 0, whose tables are in RAM already), fubk20_pattern_load() copies
-// pattern k of pats (fubk20_pal_pat or fubk20_ntsc_pat) to ram (4-byte aligned) and fills *dst.
+// The patterns other than the built-in card live in flash. Rendering from flash stalls on cache
+// misses (worst right after a switch), so the firmware copies the pattern it shows into RAM:
+// fubk20_pattern_bytes() is the RAM it needs (0 for the built-in card, whose tables are in RAM
+// already). fubk20_pattern_load() copies the tables of pattern k of pats (fubk20_pal_pat or
+// fubk20_ntsc_pat), largest first, each to place(table, bytes, ctx) (4-byte aligned; table is
+// the index into fubk20_pattern_tables()), and fills *dst; a table for which place() returns 0
+// stays in flash. Returns the bytes left in flash. fubk20_pattern_tables() gives the RAM size of
+// each of its FUBK20_NTABLES tables (0 = none).
+#define FUBK20_NTABLES 9
+typedef void *(*fubk20_place_t)(uint32_t table, uint32_t bytes, void *ctx);
 uint32_t fubk20_pattern_bytes(const fubk20_std_t *pats, uint32_t k);
-void fubk20_pattern_load(const fubk20_std_t *pats, uint32_t k, void *ram, fubk20_std_t *dst);
+void fubk20_pattern_tables(const fubk20_std_t *pats, uint32_t k, uint32_t sz[FUBK20_NTABLES]);
+uint32_t fubk20_pattern_load(const fubk20_std_t *pats, uint32_t k, fubk20_place_t place, void *ctx,
+                             fubk20_std_t *dst);
+// Image pages (img_rows != 0): fubk20_pattern_load() copies the palette and the line timing, not
+// the image; dst->img_rows still points to the rows in flash. The caller copies the rows it wants
+// in RAM (FUBK20_IMG_W bytes each, any addresses) and points dst->img_rows to its own row list.
 // switch to pattern s (one of the same standard's patterns) when frame `frame` starts;
 // timing, subcarrier phase and V-switch run on unchanged. A newer request replaces an older one.
 static inline void fubk20_request(fubk20_state_t *st, const fubk20_std_t *s, uint32_t frame)

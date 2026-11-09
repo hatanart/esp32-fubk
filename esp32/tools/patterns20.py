@@ -10,6 +10,8 @@ Edges: rectangles get exact area coverage per sample and row, circles 4 x 4 supe
 luma is low-passed for a 150 ns rise, chroma for 400 ns (as the SMPTE bars), and everything is
 cut by the soft-edged picture window.
 """
+import os
+
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
@@ -97,15 +99,7 @@ class Canvas:
         Y = (Y + self.extra_y) * area
         U = gaussian_filter1d(self.span * u, CHROMA_SIGMA, axis=-1, mode='nearest') * area
         V = gaussian_filter1d(self.span * v, CHROMA_SIGMA, axis=-1, mode='nearest') * area
-        # a picture line that holds a 2nd sync pulse (PAL line 623: equalising pulse at half
-        # line) is blanked from 1 us before that pulse, as in a real signal
-        h2 = self.std.spl / 2 / mt.FS if self.std.name == 'NTSC' else mt.pe.H2
-        half = mt.pe._step(self.t, h2 - 1e-6, 150e-9)
-        for l in range(1, self.std.lines + 1):
-            r = self.std.line_to_row(l)
-            if r is not None and self.std.line_kind(l)[1] != '-':
-                for a in (Y, U, V):
-                    a[r] *= 1 - half
+        _blank_half_lines(self.std, self.t, Y, U, V)
         return tuple(a[None] for a in (Y, U, V))
 
 
@@ -222,22 +216,124 @@ def window(std):
     return c.yuv()
 
 
-# The order is fixed: add new patterns at the end, never remove or reorder.
+IMAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'data', 'picture.png')
+
+
+def stand_in_picture(w=640, h=480):
+    """Generated 4:3 test picture (used while data/picture.png is missing): hue / saturation
+    field, grey ramp, colour patches with skin tones, circles and fine lines."""
+    from PIL import Image, ImageDraw
+    y, x = np.mgrid[0:h, 0:w] / np.array([h, w])[:, None, None]
+    hue = x * 6
+    k = np.stack([(hue + o) % 6 for o in (5, 3, 1)])          # R, G, B from hue
+    rgb = np.clip(np.minimum(k, 4 - k), 0, 1)
+    sat = np.clip(1.6 - 2.2 * y, 0, 1)                         # top: full colour, down to white
+    img = (1 - sat * (1 - rgb)) * np.clip(2.6 - 2.6 * y, 0, 1) # then down to black
+    im = Image.fromarray((np.moveaxis(img, 0, -1) * 255).astype(np.uint8))
+    d = ImageDraw.Draw(im)
+    for i in range(16):                                        # grey ramp, bottom band
+        g = round(i * 255 / 15)
+        d.rectangle([i * w // 16, h * 7 // 8, (i + 1) * w // 16, h], fill=(g, g, g))
+    skin = [(255, 224, 189), (234, 192, 134), (198, 134, 66), (141, 85, 36), (90, 56, 37)]
+    for i, c in enumerate(skin):                               # skin tones
+        d.ellipse([w * (0.08 + 0.17 * i), h * 0.62, w * (0.08 + 0.17 * i) + h * 0.14, h * 0.76], fill=c,
+                  outline=(255, 255, 255))
+    for i in range(0, 41, 2):                                  # fine lines, 1 pixel apart at 320
+        d.line([w * 0.70 + i * 2, h * 0.30, w * 0.70 + i * 2, h * 0.52], fill=(255, 255, 255), width=1)
+    d.rectangle([w * 0.05, h * 0.30, w * 0.40, h * 0.52], fill=(0, 0, 160), outline=(255, 255, 0), width=4)
+    d.text((w * 0.07, h * 0.33), 'ESP32 FuBK', fill=(255, 255, 0))
+    d.text((w * 0.07, h * 0.40), '256 colours, non-interlaced', fill=(255, 255, 255))
+    d.text((w * 0.07, h * 0.47), 'stand-in picture', fill=(0, 255, 255))
+    return im
+
+
+def image_256(std):
+    """Non-interlaced 256-colour page: data/picture.png (any 4:3 picture) or the stand-in, scaled
+    to 320 x rows (PAL 288, NTSC 240: the same 4:3 picture), colour softened, and reduced to the
+    best 256 colours. Returns (rows x 320 palette indices, 256 x 3 RGB)."""
+    from PIL import Image
+    im = Image.open(IMAGE_FILE).convert('RGB') if os.path.exists(IMAGE_FILE) else stand_in_picture()
+    im = im.resize((mt.IMG_W, std.rows), Image.LANCZOS)
+    # colour detail limited as by a video encoder (400 ns edges, as the other patterns), luma kept
+    # sharp: fewer composite artifacts (cross-colour) than full-bandwidth colour per pixel
+    a = np.asarray(im, float) / 255
+    y = 0.299 * a[..., 0] + 0.587 * a[..., 1] + 0.114 * a[..., 2]
+    sig = CHROMA_SIGMA * (mt.IMG_W / ((mt.IMG_W * 13 / 4)))       # samples -> pixels
+    u = gaussian_filter1d(0.493 * (a[..., 2] - y), sig, axis=1, mode='nearest')
+    v = gaussian_filter1d(0.877 * (a[..., 0] - y), sig, axis=1, mode='nearest')
+    r, b = y + v / 0.877, y + u / 0.493
+    g = (y - 0.299 * r - 0.114 * b) / 0.587
+    im = Image.fromarray((np.clip(np.stack([r, g, b], -1), 0, 1) * 255).round().astype(np.uint8))
+    q = im.quantize(256, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.FLOYDSTEINBERG)
+    pal = np.array(q.getpalette()[:3 * 256], np.int64).reshape(-1, 3)
+    return np.array(q, np.uint8), pal
+
+
+def pm5644(std):
+    """Philips PM5644 colour circle from its EPROM dumps (tools/pm5644.py): PAL from the G00
+    unit, NTSC from the M00 unit. 720 samples at 13.5 MHz per line, resampled to the 20 MHz grid
+    as FuBK (luma 6.2 MHz windowed sinc, chroma 1.3 MHz Gaussian)."""
+    import pm5644 as pm
+    u = pm.UNITS[std.name]
+    Yf, Uf, Vf = pm.fields(std.name)                         # (2 fields, records, 720)
+    # row 2k: field 1 record k, row 2k + 1: field 2 record k (the interleave that gives smooth
+    # edges; checked with the 2nd vertical difference). NTSC: 243 records per field, our 240
+    # rows show records 1..240.
+    o = 0 if std.name == 'PAL' else 1
+    recs = [(r % 2, r // 2 + o) for r in range(std.rows)]
+    rows = lambda a: np.array([a[f, i] for f, i in recs])
+    c = Canvas(std)
+    t0 = u['t0'] / pm.FS_SRC
+    M = mt.pe.resample_matrix(c.t, pm.FS_SRC, 720, t0, fc=6.2e6)
+    Y = (c.black + c.span * rows(Yf)) @ M.T
+    U = gaussian_filter1d(c.span * rows(Uf), mt.pe.CHROMA_SIGMA, axis=-1, mode='nearest') @ M.T
+    V = gaussian_filter1d(c.span * rows(Vf), mt.pe.CHROMA_SIGMA, axis=-1, mode='nearest') @ M.T
+    # inside the synth's active window: edges 0.2 us outside the card's own (blank) borders
+    a = (t0 + (u['pad_l'] - 3) / pm.FS_SRC, t0 + (720 - u['pad_r'] + 2) / pm.FS_SRC)
+    area = mt.pe._step(c.t, a[0], 100e-9) - mt.pe._step(c.t, a[1], 100e-9)
+    Y, U, V = (x * area for x in (Y, U, V))
+    _blank_half_lines(std, c.t, Y, U, V)
+    return tuple(x[None] for x in (Y, U, V))
+
+
+def _blank_half_lines(std, t, *arrays):
+    """A picture line that holds a 2nd sync pulse (PAL line 623: equalising pulse at half line)
+    is blanked from 1 us before that pulse, as in a real signal."""
+    h2 = std.spl / 2 / mt.FS if std.name == 'NTSC' else mt.pe.H2
+    half = mt.pe._step(t, h2 - 1e-6, 150e-9)
+    for l in range(1, std.lines + 1):
+        r = std.line_to_row(l)
+        if r is not None and std.line_kind(l)[1] != '-':
+            for a in arrays:
+                a[r] *= 1 - half
+
+
+# The extra patterns. (name, function, kind): kind '' = the standard's timing, 'noburst' = the
+# same without colour burst, 'image' = non-interlaced 256-colour picture (function returns
+# indices + palette). Add new ones at the end only.
 PATTERNS = [
-    ('crosshatch', crosshatch),
-    ('dots', dots),
-    ('circles', circles),
-    ('colour bars 100/0/75/0', colour_bars),
-    ('greyscale + PLUGE', greyscale_pluge),
-    ('white', field(WHITE)),
-    ('red', field((1, 0, 0))),
-    ('green', field((0, 1, 0))),
-    ('blue', field((0, 0, 1))),
-    ('black', field(BLACK)),
-    ('multiburst', multiburst),
-    ('overscan / safe areas', overscan),
-    ('window', window),
+    ('crosshatch', crosshatch, ''),
+    ('dots', dots, ''),
+    ('circles', circles, ''),
+    ('colour bars 100/0/75/0', colour_bars, ''),
+    ('greyscale + PLUGE', greyscale_pluge, ''),
+    ('white', field(WHITE), ''),
+    ('red', field((1, 0, 0)), ''),
+    ('green', field((0, 1, 0)), ''),
+    ('blue', field((0, 0, 1)), ''),
+    ('black', field(BLACK), ''),
+    ('multiburst', multiburst, ''),
+    ('overscan / safe areas', overscan, ''),
+    ('window', window, ''),
+    ('multiburst, no burst', multiburst, 'noburst'),
+    ('non-interlaced picture', image_256, 'image'),
 ]
+# The pattern button's order per standard; None = the standard's own test card (FuBK / SMPTE
+# bars, tables always in RAM, made in make_tables20.py). PAL starts on FuBK, NTSC on PM5644.
+# PAL PM5644 without precomputed flat colours ('noflat', as FuBK): 90 instead of 102 KB, so it
+# fits in RAM next to everything else
+ORDER = {'PAL': [None, ('PM5644', pm5644, 'noflat')] + PATTERNS,
+         'NTSC': [('PM5644', pm5644, ''), None] + PATTERNS}
 
 
 def to_rgb8(std, Y, U, V):

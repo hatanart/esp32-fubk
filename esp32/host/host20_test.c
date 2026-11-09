@@ -1,6 +1,7 @@
 // Host test for fubk_synth20.c: write N frames of plain uint8 codes.
 //   host20 <out.u8> <frames> [split] [ntsc] [patterns] [vbi] [first frame]
-// patterns: comma list, frame f shows pattern list[min(f, len - 1)] (default "0"). The switch is
+// patterns: comma list (the button's numbers), frame f shows pattern list[min(f, len - 1)]
+// (default: the built-in card, FuBK / SMPTE bars). The switch is
 // requested before every buffer for the next frame start, as the firmware's pattern button does.
 // split = 1: render like the dual-core firmware (main20.c): 2 lines per buffer, state 0 renders
 // the even buffers, state 1 the odd ones; after rendering its buffer each state skips the next
@@ -14,6 +15,17 @@
 #include <time.h>
 #include "fubk_synth20.h"
 
+// one malloc per table, filled with junk first
+static void *host_place(uint32_t table, uint32_t bytes, void *ctx)
+{
+    (void)table;
+    (void)ctx;
+    void *m = malloc(bytes);
+    if (m)
+        memset(m, 0x5A, bytes);
+    return m;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3) {
@@ -24,7 +36,7 @@ int main(int argc, char **argv)
     const fubk20_std_t *s = (argc > 4 && atoi(argv[4])) ? &fubk20_ntsc : &fubk20_pal;
     const fubk20_std_t *pats = s == &fubk20_ntsc ? fubk20_ntsc_pat : fubk20_pal_pat;
     int seq[64], nseq = 0;
-    for (const char *c = argc > 5 ? argv[5] : "0"; *c && nseq < 64; ) {
+    for (const char *c = argc > 5 ? argv[5] : (s == &fubk20_ntsc ? "1" : "0"); *c && nseq < 64; ) {
         int k = atoi(c);
         if (k < 0 || k >= FUBK20_NPAT)
             return 4;
@@ -34,20 +46,37 @@ int main(int argc, char **argv)
         if (*c == ',')
             c++;
     }
-    // as the firmware: render the extra patterns from RAM copies (checks fubk20_pattern_load)
+    // as the firmware: render the patterns from RAM copies (checks fubk20_pattern_load), except
+    // the built-in card (FuBK / SMPTE bars), whose tables are in RAM already
     static fubk20_std_t ram[FUBK20_NPAT];
     const fubk20_std_t *use[FUBK20_NPAT];
-    use[0] = s;
-    for (int k = 1; k < FUBK20_NPAT; k++) {
-        void *m = malloc(fubk20_pattern_bytes(pats, k));
-        if (!m)
+    uint32_t main_k = s == &fubk20_ntsc ? FUBK20_NTSC_MAIN : FUBK20_PAL_MAIN;
+    for (uint32_t k = 0; k < FUBK20_NPAT; k++) {
+        if (k == main_k) {
+            if (fubk20_pattern_bytes(pats, k))
+                return 6;
+            use[k] = s;
+            continue;
+        }
+        if (fubk20_pattern_load(pats, k, host_place, NULL, &ram[k]))
             return 5;
-        memset(m, 0x5A, fubk20_pattern_bytes(pats, k));
-        fubk20_pattern_load(pats, k, m, &ram[k]);
+        if (ram[k].img_rows) {                        // image page: every row its own RAM block
+            static const uint8_t *rows[FUBK20_NPAT][FUBK20_IMG_MAX_ROWS];
+            for (uint32_t r = 0; r < ram[k].rows; r++) {
+                uint8_t *row = malloc(FUBK20_IMG_W);
+                if (!row)
+                    return 5;
+                memcpy(row, pats[k].img_rows[r], FUBK20_IMG_W);
+                rows[k][r] = row;
+            }
+            ram[k].img_rows = rows[k];
+        }
         use[k] = &ram[k];
     }
     s = use[seq[0]];
-    long lines = atol(argv[2]) * s->lines;
+    long lines = 0;                                   // frames of their own length (312 / 625 ...)
+    for (long fr = 0; fr < atol(argv[2]); fr++)
+        lines += use[seq[fr < nseq ? fr : nseq - 1]]->lines;
     FILE *f = fopen(argv[1], "wb");
     if (!f)
         return 1;
