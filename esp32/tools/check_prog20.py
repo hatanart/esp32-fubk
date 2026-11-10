@@ -174,22 +174,38 @@ def main():
     rows = [(l, std.line_to_row(l)) for l in range(1, L + 1) if std.line_to_row(l) is not None]
     if len(rows) != std.rows:
         fail('picture rows')
-    X, Yv, C = [], [], []
+    X, Yv, C, G = [], [], [], []
     for f in range(nf):
         for l, r in rows:
             X.append(mv[f, l - 1, cols])
             C.append(idx[r, pix])
+            G.append(np.full(len(cols), vsgn[f, l - 1, 0]))
             Yv.append(np.stack([np.ones(len(cols)), sn[f, l - 1, cols], vsgn[f, l - 1] * cs[f, l - 1, cols]], 1))
-    X, C, Yv = np.concatenate(X), np.concatenate(C), np.concatenate(Yv)
+    X, C, Yv, G = np.concatenate(X), np.concatenate(C), np.concatenate(Yv), np.concatenate(G)
+    # expected colours: the exact ones, with the DAC correction (make_tables20.palette_entries)
+    # where it is on: chroma raised by the DAC's loss and turned ahead by its lag; on -V lines
+    # (V switched back) that turn is the other way
+    want = {}
+    Yd, Ud, Vd = pal.T
+    A = np.hypot(Ud, Vd)
+    lag, k = np.zeros_like(A), np.ones_like(A)
+    if mt.DAC_CORR:
+        lag, gain = mt.dac_correction(std, (Yd - mt.BLANK) * mt.LSB_MV, A * mt.LSB_MV)
+        room = np.minimum(253.5 - Yd, Yd - 1.5)
+        k = np.where(A > 0, np.minimum(A / gain, np.maximum(room, A)) / np.maximum(A, 1e-9), 1.0)
+    for sg in (1, -1):
+        r = np.radians(lag) * sg
+        want[sg] = np.stack([Yd - mt.BLANK, k * (Ud * np.cos(r) - Vd * np.sin(r)),
+                             k * (Vd * np.cos(r) + Ud * np.sin(r))], 1) * mt.LSB_MV
     worst = np.zeros(3)
     used = np.unique(C)
     for c in used:
-        m = C == c
-        y, u, v = np.linalg.lstsq(Yv[m], X[m], rcond=None)[0]
-        e = np.abs(np.array([y, u, v]) - (pal[c] - [mt.BLANK, 0, 0]) * mt.LSB_MV)
-        worst = np.maximum(worst, e)
+        for sg in np.unique(G):
+            m = (C == c) & (G == sg)
+            y, u, v = np.linalg.lstsq(Yv[m], X[m], rcond=None)[0]
+            worst = np.maximum(worst, np.abs(np.array([y, u, v]) - want[sg][c]))
     print(f'  picture: {len(used)} colours used on {std.rows} rows x {mt.IMG_W} pixels; worst fitted error '
-          f'Y {worst[0]:.2f} / U {worst[1]:.2f} / V {worst[2]:.2f} mV (vs the exact colour; 1 DAC step = 5 mV)')
+          f'Y {worst[0]:.2f} / U {worst[1]:.2f} / V {worst[2]:.2f} mV (vs the exact colour' + (' with the DAC correction' if mt.DAC_CORR else '') + f'; 1 DAC step = 5 mV)')
     if worst.max() > mt.LSB_MV:
         fail('a colour is off by more than 1 DAC step')
     print('  OK')

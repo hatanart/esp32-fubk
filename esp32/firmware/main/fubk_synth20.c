@@ -37,6 +37,14 @@
 #define CAR_Q 14
 #define BURST_Q 6
 #define RND (1 << (CAR_Q - 1))
+// a UV block: U, V of its 32 samples, then its carrier offset d (2 bytes, low first). The block
+// reads its carrier at index + d (DAC correction: advances its chroma by the DAC's lag there).
+#define UVS (2 * B + 2)
+// (UVS is even, so the offset is 16-bit aligned)
+#define UV_OFS(uv) (*(const uint16_t *)((uv) + 2 * B))
+// carrier pointer p (= car + m + ...) moved by d, wrapped so that m + d stays below n
+// (branch-free: the sign of n - 1 - m - d as a mask)
+#define CAR_AT(p, m, d) ((p) + (int32_t)(d) - ((int32_t)(n - 1 - (m) - (d)) >> 31 & (int32_t)n))
 
 _Static_assert(F20_NB <= F20_MAX_NB && N20_NB <= F20_MAX_NB, "too many blocks");
 _Static_assert(F20_SPL <= F20_MAX_SPL && N20_SPL <= F20_MAX_SPL, "line too long");
@@ -480,10 +488,12 @@ FUBK_HOT void fubk20_line(fubk20_state_t *st, fubk_sample_t *buf, uint32_t off)
         // a sync pulse sits inside the picture (PAL line 623)
         for (uint32_t b = 0; b < nb; b++) {
             const uint8_t *y = ypool + st->cur_y[b] * B;
-            const int8_t *uv = uvpool + st->cur_uv[b] * (2 * B);
+            const int8_t *uv = uvpool + st->cur_uv[b] * UVS;
+            uint32_t d = UV_OFS(uv);
+            const int16_t *S = CAR_AT(Sb, ms, d), *C = CAR_AT(Cb, mc, d);
             for (int j = 0; j < B; j++) {
                 uint32_t i = a0 + b * B + j;
-                int32_t c = (uv[2 * j] * Sb[i] + uv[2 * j + 1] * Cb[i] + RND) >> CAR_Q;
+                int32_t c = (uv[2 * j] * S[i] + uv[2 * j + 1] * C[i] + RND) >> CAR_Q;
                 PUT(off + i, y[j] + t[i] - BLANK + c);
             }
         }
@@ -508,10 +518,12 @@ FUBK_HOT void fubk20_line(fubk20_state_t *st, fubk_sample_t *buf, uint32_t off)
                     p[ODD1(j)] = W16(y[j + 1] + w[j + 1]);
                 }
             } else {
-                const int8_t *uv = uvpool + ui * (2 * B);
+                const int8_t *uv = uvpool + ui * UVS;
+                uint32_t d = UV_OFS(uv);
+                const int16_t *S1 = CAR_AT(S, ms, d), *C1 = CAR_AT(C, mc, d);
                 for (int j = 0; j < B; j += 2) {
-                    p[ODD0(j)] = W16(y[j] + ((uv[2 * j] * S[j] + uv[2 * j + 1] * C[j] + RND) >> CAR_Q));
-                    p[ODD1(j)] = W16(y[j + 1] + ((uv[2 * j + 2] * S[j + 1] + uv[2 * j + 3] * C[j + 1] + RND) >> CAR_Q));
+                    p[ODD0(j)] = W16(y[j] + ((uv[2 * j] * S1[j] + uv[2 * j + 1] * C1[j] + RND) >> CAR_Q));
+                    p[ODD1(j)] = W16(y[j + 1] + ((uv[2 * j + 2] * S1[j + 1] + uv[2 * j + 3] * C1[j + 1] + RND) >> CAR_Q));
                 }
             }
         }
@@ -531,10 +543,12 @@ FUBK_HOT void fubk20_line(fubk20_state_t *st, fubk_sample_t *buf, uint32_t off)
                 for (int j = 0; j < B; j += 2)
                     *op++ = PAIR(y[j] + w[j], y[j + 1] + w[j + 1]);
             } else {
-                const int8_t *uv = uvpool + ui * (2 * B);
+                const int8_t *uv = uvpool + ui * UVS;
+                uint32_t d = UV_OFS(uv);
+                const int16_t *S1 = CAR_AT(S, ms, d), *C1 = CAR_AT(C, mc, d);
                 for (int j = 0; j < B; j += 2) {
-                    int32_t v0 = y[j] + ((uv[2 * j] * S[j] + uv[2 * j + 1] * C[j] + RND) >> CAR_Q);
-                    int32_t v1 = y[j + 1] + ((uv[2 * j + 2] * S[j + 1] + uv[2 * j + 3] * C[j + 1] + RND) >> CAR_Q);
+                    int32_t v0 = y[j] + ((uv[2 * j] * S1[j] + uv[2 * j + 1] * C1[j] + RND) >> CAR_Q);
+                    int32_t v1 = y[j + 1] + ((uv[2 * j + 2] * S1[j + 1] + uv[2 * j + 3] * C1[j + 1] + RND) >> CAR_Q);
                     *op++ = PAIR(v0, v1);
                 }
             }

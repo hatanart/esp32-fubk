@@ -1,9 +1,10 @@
 // PAL / NTSC test pattern generator at 20 MS/s on the ESP32 internal DAC (GPIO25), ESP-IDF v5.x.
 //   PAL : FuBK test card          NTSC: Philips PM5644 (then SMPTE colour bars)
 //
-// The APLL runs at 80 MHz with integer coefficients only (sdm0 = sdm1 = 0, sdm2 = 8, odiv = 1),
-// so there is no sigma-delta clock jitter; I2S sends APLL / 4 = 20 MS/s. The subcarrier is
-// computed per sample (fubk_synth20.c).
+// I2S runs from PLL_D2 (160 MHz, the PLL of the CPU and the bus) at 20 MS/s, so the DAC's data
+// and clock keep the same phase on every start (from the APLL, some cold starts gave snow:
+// the DAC missed updates). FUBK_CLK_APLL=1 builds the old clock, the APLL at 80 MHz with integer
+// coefficients (no sigma-delta jitter) / 4. The subcarrier is computed per sample (fubk_synth20.c).
 //
 // Front panel (like the earlier box):
 //   GPIO4  button to GND ("D4"): toggles PAL / NTSC (saved in NVS, then restart)
@@ -288,6 +289,15 @@ static void start_video(void *arg)
     next_buf[1] = 1;
     I2S0.out_link.addr = (uint32_t)&desc[0];
 
+#ifndef FUBK_CLK_APLL
+    // PLL_D2 (160 MHz, the same PLL as the CPU and the bus) / 4, so the DAC's data and clock keep
+    // the same phase on every start (div 2 measured too fast)
+    I2S0.clkm_conf.clkm_div_num = 4;
+    I2S0.clkm_conf.clkm_div_b = 0;
+    I2S0.clkm_conf.clkm_div_a = 1;
+    I2S0.sample_rate_conf.tx_bck_div_num = 1;
+    I2S0.clkm_conf.clka_en = 0;                    // clock from PLL_D2
+#else
     // APLL = 40 MHz * (4 + 8) / (2 * (1 + 2)) = 80 MHz, integer only: no sigma-delta jitter
     periph_rtc_apll_acquire();
     rtc_clk_apll_coeff_set(1, 0, 0, 8);
@@ -296,6 +306,7 @@ static void start_video(void *arg)
     I2S0.clkm_conf.clkm_div_a = 1;
     I2S0.sample_rate_conf.tx_bck_div_num = 1;
     I2S0.clkm_conf.clka_en = 1;                    // clock from APLL; sample rate = APLL / 4
+#endif
 
     dac_output_enable(DAC_CHAN_0);                 // GPIO25
     dac_i2s_enable();
@@ -305,8 +316,14 @@ static void start_video(void *arg)
     I2S0.out_link.start = 1;
     I2S0.conf.tx_start = 1;
     ESP_ERROR_CHECK(esp_intr_enable(isr_handle));
-    ESP_LOGI(TAG, "video started on GPIO25: %s, 20 MS/s (integer APLL 80 MHz), %u samples/line, "
-             "fsc %.2f Hz; 1 kHz tone on GPIO%d", S->name, S->spl,
+    ESP_LOGI(TAG, "video started on GPIO25: %s, 20 MS/s (%s), %u samples/line, "
+             "fsc %.2f Hz; 1 kHz tone on GPIO%d", S->name,
+#ifndef FUBK_CLK_APLL
+             "PLL_D2 160 MHz",
+#else
+             "integer APLL 80 MHz",
+#endif
+             S->spl,
              20e6 * S->ph_num / S->ph_den, PIN_AUDIO);
 #ifdef FUBK_TEST_FIELD
     if (S == &fubk20_pal)

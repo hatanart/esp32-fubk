@@ -72,3 +72,10 @@ set(FUBK_START_PATTERN 0 CACHE STRING "pattern to step to at start (test builds)
 if(FUBK_START_PATTERN)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE FUBK_START_PATTERN=${FUBK_START_PATTERN})
 endif()
+# Old clock (up to v1.4): I2S from the integer APLL (80 MHz) instead of PLL_D2 (160 MHz, the CPU's
+# PLL). The APLL's phase against the bus is random at each start; some cold starts gave snow.
+#   idf.py -DFUBK_CLK_APLL=1 build   (remembered; =0 switches back)
+option(FUBK_CLK_APLL "I2S clock from the APLL instead of PLL_D2" OFF)
+if(FUBK_CLK_APLL)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE FUBK_CLK_APLL)
+endif()

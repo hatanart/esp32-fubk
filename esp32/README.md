@@ -106,8 +106,13 @@ one per descriptor (2272 or 2280 bytes each). Excludes `FUBK_FRAME_LOCK`.
 
 `firmware/main/main20.c` + `fubk_synth20.c`, tables from `tools/make_tables20.py`.
 
-- APLL 80 MHz with integer coefficients only (sdm0 = sdm1 = 0, sdm2 = 8, odiv = 1): no
-  sigma-delta jitter. I2S sends APLL / 4 = 20 MS/s.
+- I2S clock from PLL_D2 (160 MHz, the PLL of the CPU and the bus), clkm_div 4: 20 MS/s from the
+  crystal, no sigma-delta jitter. Up to v1.4 it was the APLL at 80 MHz with integer coefficients
+  only (sdm0 = sdm1 = 0, sdm2 = 8, odiv = 1), APLL / 4. That clock's phase against the bus is
+  random at each start, and on some cold starts the DAC missed updates (the output held one level
+  for 2-7 samples: snow, mostly in bright colours, clearing when the chip warmed or after a
+  restart). With PLL_D2 the phase is the same on every start; no snow on cold starts since.
+  `idf.py -DFUBK_CLK_APLL=1 build` selects the APLL clock.
 - Line = 1280 samples = 64.000 us, 625 lines, exact fsc 4 433 618.75 Hz (283.75 fh + 25 Hz):
   the full 8-field sequence repeats after 4 frames (3 200 000 samples = 709 379 cycles).
 - Chroma per sample: `Y + (U * car[n + ms] + V * car[n + mc] + 2^13) >> 14`, one 2304-entry
@@ -118,13 +123,13 @@ one per descriptor (2272 or 2280 bytes each). Excludes `FUBK_FRAME_LOCK`.
   ones; each keeps its own state and skips the other's lines. The log prints the load per core.
 - Checks: `../venv/bin/python tools/make_tables20.py [--test-field]`, `make -C host test20`
   (C == model, also split over 2 states), `../venv/bin/python tools/check20.py out/model20_4frames.u8`
-  (burst 150 mV at 135/225 deg less the 9.1 deg DAC correction, chroma error < 1 LSB, anti-PAL
-  grey with PAL-D).
-- DAC phase correction (PAL only): the burst is rotated -26 carrier steps (-9.1 deg) against the
-  picture (`PAL.burst_rot` in make_tables20.py, `burst_ofs` in the tables). The DAC output shifts
-  the picture chroma (higher levels) about 9 deg against the burst (near blanking). Test build:
-  `idf.py -DFUBK_BURST_TEST=1 build` (remembered; =0 back): the pattern button then adds 0, +1,
-  -1, +2, -2 deg to the burst instead of changing the pattern.
+  (burst 150 mV at 135/225 deg, chroma error < 1 LSB against the source with the DAC
+  correction applied, anti-PAL grey with PAL-D).
+- DAC correction: see "DAC correction (scope map)" below. With `FUBK_DAC_CORR=0` (tables made
+  without it) the burst is rotated -26 carrier steps (-9.1 deg) instead, as up to v1.4
+  (`PAL.burst_rot`, `burst_ofs` in the tables). Test build: `idf.py -DFUBK_BURST_TEST=1 build`
+  (remembered; =0 back): the pattern button then adds 0, +1, -1, +2, -2 deg to the burst instead
+  of changing the pattern.
 
 ### Hardware results (110 ohm series resistor into 75 ohm)
 
@@ -140,6 +145,10 @@ Default build = 20 MHz standard PAL (`FUBK_20MHZ=1`, the others off):
   - Fix: the burst is rotated -9.1 deg (sweep with `FUBK_BURST_TEST`: best between -9.5 and
     -8.4 deg). Then the bars are gone on every screen and the anti-PAL boxes are grey on the
     plasma and the reverse-camera monitor. NTSC looked right and was left alone.
+- 2026-11-09 the scope (below) showed the 9 deg is an average: the lag depends on the level.
+  The per-block correction replaced the burst rotation; full-field red then had no bars left on
+  the RetroScaler. FuBK's cyan and yellow still show faint ones there although the scope puts
+  them within 0.6 deg on both line types (probably the scaler's own decoder).
 - `FUBK20_LINE1281=1` (same phase every line): stripes stand still on the RetroScaler, but the
   subcarrier is +417 Hz off and the plasma's colour flashes on and off. No integer APLL clock
   gives same-phase lines closer to the right frequency (best: 25 MHz, +109 Hz, too much DMA/CPU).
@@ -237,6 +246,39 @@ Default build = 20 MHz standard PAL (`FUBK_20MHZ=1`, the others off):
   49 KB once the tasks run) and stayed in flash. The image page leaves 7.7 KB free, so the
   heap blocks are freed before the PAL / NTSC switch writes NVS.
 - CPU, PM5644 PAL: avg 49 % / max 81 % (FuBK 40 / 76).
+
+## DAC correction (scope map)
+
+- Measurement: Siglent SDS824X HD, 75 ohm load at the RCA plug, 20 MHz bandwidth limit, 2 GS/s,
+  100 us records, video trigger on one line, averaging on (the test pattern's subcarrier is
+  frame-locked). Fits: burst and each step's chroma against one sine at fsc, phase difference
+  against what the samples hold (`-U` chroma: 180 deg; burst 135 / 225 deg). The scope filter
+  delays burst and chroma alike, so it drops out.
+- Test pattern (`patterns20.phase_test`, not in the pattern list; add it as described in
+  patterns20.py): 9 bands of `-U` chroma 50 .. 450 mV peak, each with 8 luma steps 0 .. 700 mV
+  above blanking; cells outside -233 .. 933 mV have no chroma. PAL timing `PAL_LOCK`: lines 8,
+  16, .. 600 are 2 samples longer (+150 samples per frame: 177378.002 cycles) and the phase
+  restarts every frame, so frames repeat and the scope can average.
+- Result (correction off): lag -2.8 deg (small chroma on black) .. +21 deg (white), growing with
+  luma (steeply above 500 mV) and with chroma amplitude (about +3 deg per 100 mV); gain 1.0 up to
+  about 400 mV of luma, 0.73 .. 0.84 on white. The burst sits like 150 mV of chroma on black (0
+  deg), so the map is relative to it. Probably the DAC output stage driving 185 ohm: near the
+  top of its range and with large swings it gets slower and weaker.
+- `make_tables20.build`: per sample, gain and lag interpolated (bilinear, clamped) from `DAC_LAG`
+  / `DAC_GAIN`; chroma divided by the gain, but only as far as the DAC range allows; per block the
+  amplitude^2-weighted lag, rounded to 360 / car_n deg (PAL 0.35, NTSC 1.0), stored as the
+  carrier offset d = k car_inv mod car_n in 2 bytes after the block's U, V (UV blocks are 66
+  bytes; same U, V with another d is another block). NTSC uses the PAL map scaled by fsc
+  (assumes a delay; not measured). Image page: per palette colour (gain into `a`, lag into k).
+- Synth: per colour block `S = car + ms + d`, `C = car + mc + d`, wrapped below car_n without a
+  branch (a branch cost 13 % CPU on the all-colour test field; a carrier table one period longer
+  would need no wrap but takes 2 KB, which the picture page needs). Flat-colour waveforms have d
+  built in. Worst case (orange test field) max 101 / 103 % (v1.4: 99 / 101 %), FuBK 76 %,
+  PM5644 PAL 85 %, picture page 64 %.
+- Check (correction on, same pattern): residual within +-0.5 deg on almost all cells, up to 2.0
+  deg on the brightest strong cells (luma + chroma 850 .. 900 mV); gain within 2 %, except on
+  white where the DAC range limits the boost. FuBK bars on +V and -V lines: yellow +0.6, cyan
+  0.0 / +0.1, red 0.0 / -0.4 deg.
 
 ## Card text (PM8503 font) and the edit mode
 

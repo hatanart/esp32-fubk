@@ -34,6 +34,7 @@ T0 = 0.8e-6                       # buffer start before 0H (16 samples)
 LSB_MV = 5.0
 BLANK = 64
 B = 32                            # samples per block
+UVS = 2 * B + 2                   # bytes per UV block: U, V per sample, then the carrier offset
 CAR_Q = 14
 BURST_Q = 6                       # burst components in 1/64 LSB
 KINDS = ['N-', 'NE', 'EE', 'BB', 'BE', 'EB', 'E-']
@@ -130,7 +131,11 @@ NTSC = Std('NTSC', 'n20', 1271, 525, 180, 34, 104, 76, 352, 63, 63, 352, False, 
 # and decoders without a full delay line (RetroScaler 2X, 77" OLED AV) showed moving Hanover bars.
 # Found 2026-11-08 by eye with the FUBK_BURST_TEST firmware (best between -27 and -24 steps).
 # NTSC looks right on screens and is left alone.
-PAL.burst_rot = -26
+# 2026-11-09 the scope map (DAC_LAG below) showed the shift depends on the level: with the DAC
+# correction on (default) the picture chroma is corrected per block instead and the burst stays
+# at its standard phase. FUBK_DAC_CORR=0 in the environment gives the old fixed rotation.
+DAC_CORR = os.environ.get('FUBK_DAC_CORR', '1') != '0'
+PAL.burst_rot = 0 if DAC_CORR else -26
 NTSC.period_frames = 2           # (2 frames are enough for the checks)
 # The exact NTSC line is 227.5 cycles = 227.5 * 352 / 63 = 11440 / 9 samples: 8 line pairs of
 # 1271 samples and 1 pair of 1272 per 9 pairs. Average line rate exactly 15734.27 Hz (227.5 fsc
@@ -192,6 +197,13 @@ NTSC_PROG = replace(NTSC, lines=262, rows=240, data_frames=1, period_frames=1, p
                     line_to_row=lambda l: l - 22 if 22 <= l <= 261 else None,
                     short_line=262, short_by=10)
 assert (262 * NTSC.spl - 10) * NTSC.ph_num % NTSC.ph_den == 0
+# PAL with the subcarrier locked to the frame (the phase test pattern): 625 x 1280 samples =
+# 177344.75 cycles; lines 8, 16, .. 600 are 2 samples longer (+150 samples: 0.8 deg left over,
+# a step in the vertical sync) and the phase restarts at every frame, so a scope on one line can
+# average (frames 2 apart identical; with V = 0 in the picture, all frames but the burst)
+PAL_LOCK = replace(PAL, ext_every=8, ext_n=75, ph_reset=True)
+_c = ((625 * PAL.spl + 150) * PAL.ph_num % PAL.ph_den) / PAL.ph_den
+assert min(_c, 1 - _c) < 0.003, _c
 IMG_W = 320                       # image pixels per line: 4 pixels = 13 samples (3.25 each)
 IMG_MAP13 = [0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3]   # pixel (of 4) of each of 13 samples
 
@@ -264,6 +276,58 @@ def smpte_picture():
 
 
 # --- tables ------------------------------------------------------------------------------------
+# --- DAC correction -------------------------------------------------------------------------
+# Measured 2026-11-09 on the scope (75 ohm load, 2 GS/s, 20 MHz bandwidth limit) with the phase
+# test pattern (PAL, -U chroma on luma steps, correction off; 9 x 8 points): the chroma lag against the burst (deg at 4.43 MHz)
+# and its amplitude against the burst's, per luma level (mV above blanking) and chroma amplitude
+# (mV peak, as sent). The ESP32 DAC output gets slower and weaker near the top of its range and
+# with bigger swings; the burst (150 mV at blanking) sits at about 0 lag. None = not measured
+# (out of the range of real colour signals).
+DAC_MAP_Y = (0.0, 100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0)
+DAC_MAP_A = (50.0, 100.0, 150.0, 200.0, 250.0, 300.0, 350.0, 400.0, 450.0)
+DAC_LAG = ((-2.78, -2.58, -2.42, 0.13, 0.20, 1.70, 5.32, 18.35),
+           (-1.37, -1.25, -0.89, 0.56, 1.57, 3.29, 7.54, 20.16),
+           (0.12, 0.18, 0.69, 2.08, 3.29, 4.99, 10.00, 21.41),
+           (2.15, 1.84, 2.68, 3.62, 5.16, 7.45, 13.45, 21.21),
+           (None, 4.00, 4.54, 5.41, 7.03, 10.44, 16.33, None),
+           (None, 6.48, 6.61, 7.57, 9.54, 13.47, 18.39, None),
+           (None, None, 8.98, 10.03, 12.04, 16.61, None, None),
+           (None, None, 11.14, 12.08, 14.91, 19.03, None, None),
+           (None, None, None, 14.68, 17.74, None, None, None))
+DAC_GAIN = ((1.004, 1.009, 1.027, 0.970, 0.990, 1.001, 0.963, 0.835),
+            (1.005, 1.015, 1.016, 0.978, 0.970, 0.987, 0.946, 0.810),
+            (1.000, 1.010, 1.008, 0.987, 0.974, 0.980, 0.931, 0.776),
+            (1.009, 1.006, 1.002, 0.992, 0.977, 0.964, 0.916, 0.729),
+            (None, 1.001, 0.994, 0.987, 0.973, 0.947, 0.881, None),
+            (None, 0.996, 0.989, 0.982, 0.968, 0.933, 0.833, None),
+            (None, None, 0.983, 0.976, 0.958, 0.913, None, None),
+            (None, None, 0.982, 0.972, 0.947, 0.884, None, None),
+            (None, None, None, 0.963, 0.934, None, None, None))
+DAC_TOP_MV = (254 - BLANK) * LSB_MV           # the DAC's range above / below blanking (1 step spare)
+DAC_BOTTOM_MV = (BLANK - 1) * LSB_MV
+
+
+def _dac_grid(rows):
+    a = np.array([[np.nan if v is None else v for v in r] for r in rows])
+    for r in a:                                   # unmeasured corners: the nearest step of the band
+        ok = np.nonzero(~np.isnan(r))[0]
+        r[:] = np.interp(np.arange(len(r)), ok, r[ok])
+    return a
+
+
+def dac_correction(std, y, amp):
+    """Chroma lag (deg at the standard's fsc) and gain of the DAC at luma y (mV above blanking)
+    and chroma amplitude amp (mV peak); bilinear in the measured map, clamped at its edges. NTSC:
+    the PAL lag scaled by fsc (assumes the lag is a delay)."""
+    from scipy.interpolate import RegularGridInterpolator
+    pts = np.stack([np.clip(amp, DAC_MAP_A[0], DAC_MAP_A[-1]), np.clip(y, DAC_MAP_Y[0], DAC_MAP_Y[-1])], -1)
+    lag = RegularGridInterpolator((DAC_MAP_A, DAC_MAP_Y), _dac_grid(DAC_LAG))(pts)
+    gain = RegularGridInterpolator((DAC_MAP_A, DAC_MAP_Y), _dac_grid(DAC_GAIN))(pts)
+    if std.name == 'NTSC':
+        lag = lag * (315e6 / 88) / pe.FSC
+    return lag, gain
+
+
 def build(std, Y, U, V, flat=None):
     """flat: precompute flat-colour chroma (default: NTSC only; PAL FuBK has few flat blocks)."""
     if flat is None:
@@ -292,6 +356,17 @@ def build(std, Y, U, V, flat=None):
     k = np.arange(std.car_n + std.spl)
     car = np.round((1 << CAR_Q) * np.sin(2 * np.pi * ((std.car_step * k) % std.car_n) / std.car_n)).astype(np.int64)
 
+    # DAC correction: chroma gain per sample; its lag as a carrier offset per block (below)
+    amp = np.hypot(U, V)
+    lag = np.zeros_like(amp)
+    if DAC_CORR and amp.any():
+        lag, gain = dac_correction(std, Y, amp)
+        U, V = U / gain, V / gain
+        # the gain must not take the signal out of the DAC's range: there it keeps what fits
+        room = np.minimum(DAC_TOP_MV - Y, Y + DAC_BOTTOM_MV)
+        a2 = np.hypot(U, V)
+        k = np.where(a2 > room, np.maximum(room, amp) / np.maximum(a2, 1e-9), 1.0)
+        U, V = U * k, V * k
     Yq = np.round(Y / LSB_MV).astype(np.int64)
     Uq = np.round(U / LSB_MV).astype(np.int64)
     Vq = np.round(V / LSB_MV).astype(np.int64)
@@ -305,9 +380,12 @@ def build(std, Y, U, V, flat=None):
     assert (Yq + BLANK).min() >= 0 and (Yq + BLANK).max() <= 255
     assert np.abs(Uq).max() <= 127 and np.abs(Vq).max() <= 127
 
-    # block pools: Y blocks (uint8, Y + BLANK), UV blocks (int8 interleaved). UV block 0 = zero.
-    zero = np.zeros(2 * B, np.int64)
+    # block pools: Y blocks (uint8, Y + BLANK), UV blocks (int8 interleaved, then the block's
+    # carrier offset d as 2 bytes, low first: the synth reads its carrier at index + d, which
+    # advances the chroma by the DAC lag on +V and -V lines alike). UV block 0 = zero.
+    zero = np.zeros(UVS, np.int64)
     ypool, uvpool, yid, uvid = [], [zero], {}, {zero.tobytes(): 0}
+    step = 360.0 / std.car_n
     nrows = nd * std.rows
     ymap = np.zeros((nrows, std.nb), np.int64)
     uvmap = np.zeros((nrows, std.nb), np.int64)
@@ -320,8 +398,13 @@ def build(std, Y, U, V, flat=None):
                 if key not in yid:
                     yid[key] = len(ypool)
                     ypool.append(yb)
-                uvb = np.empty(2 * B, np.int64)
-                uvb[0::2], uvb[1::2] = Uq[df, r, s], Vq[df, r, s]
+                uvb = np.zeros(UVS, np.int64)
+                uvb[0:2 * B:2], uvb[1:2 * B:2] = Uq[df, r, s], Vq[df, r, s]
+                wgt = amp[df, r, s] ** 2
+                if uvb[:2 * B].any() and wgt.sum() > 0:  # amplitude-weighted lag of the block
+                    k = int(round(float((wgt * lag[df, r, s]).sum() / wgt.sum()) / step)) % std.car_n
+                    d = k * std.car_inv % std.car_n
+                    uvb[2 * B], uvb[2 * B + 1] = ((d & 0xFF) ^ 0x80) - 0x80, d >> 8
                 ukey = uvb.tobytes()
                 if ukey not in uvid:
                     uvid[ukey] = len(uvpool)
@@ -371,10 +454,10 @@ def build(std, Y, U, V, flat=None):
             shifts.append((3 * q * std.car_inv) % std.car_n)
         kk = np.arange(std.car_n + B)
         for i, uvb in enumerate(uvpool):
-            u, v = uvb[0::2], uvb[1::2]
+            u, v, d = uvb[0:2 * B:2], uvb[1:2 * B:2], uv_ofs(uvb)
             if i and (u == u[0]).all() and (v == v[0]).all():
                 for sh in shifts:
-                    wtab.append((u[0] * car[kk % std.car_n] + v[0] * car[(kk + sh) % std.car_n]
+                    wtab.append((u[0] * car[(kk + d) % std.car_n] + v[0] * car[(kk + d + sh) % std.car_n]
                                  + (1 << (CAR_Q - 1))) >> CAR_Q)
                 flat_ix[i] = len(wtab) // len(shifts)
         assert len(wtab) // len(shifts) <= 255
@@ -383,6 +466,11 @@ def build(std, Y, U, V, flat=None):
                 ypool=np.array(ypool), uvpool=np.array(uvpool), ymap=ymap, uvmap=uvmap,
                 delta=np.array(delta, np.int64), row_start=np.array(row_start),
                 line_info=np.array(info), rowmap=rowmap, bits=(POS_BITS, Y_BITS, UV_BITS))
+
+
+def uv_ofs(uvb):
+    """The carrier offset stored at the end of a UV block."""
+    return (int(uvb[2 * B]) & 0xFF) | (int(uvb[2 * B + 1]) & 0xFF) << 8
 
 
 def palette_yuv(std, rgb):
@@ -407,12 +495,17 @@ def palette_entries(std, yuv):
     for theta = t / N cycles. k[0] for +V lines (C = +cos), k[1] for -V lines (V negated)."""
     Y, U, V = yuv.T
     A = np.hypot(U, V)
+    lag = np.zeros_like(A)
+    if DAC_CORR:                                    # DAC correction (as build()): gain, lag
+        lag, gain = dac_correction(std, (Y - BLANK) * LSB_MV, A * LSB_MV)
+        room = np.minimum(253.5 - Y, Y - 1.5)        # DAC steps, as the assert below
+        A = np.minimum(np.where(A > 0, A / gain, 0), np.maximum(room, A))
     assert ((Y - A).min() >= 0.5 and (Y + A).max() <= 254.5), 'palette colour clips the DAC'
     ent = np.zeros((len(yuv), 4), np.int64)
     ent[:, 0] = np.round(Y * (1 << IMG_SHIFT)).astype(np.int64) + (1 << (IMG_SHIFT - 1))
     ent[:, 1] = np.round(A * (1 << (IMG_SHIFT - CAR_Q))).astype(np.int64)
     for j, sv in enumerate((1, -1 if std.vswitch else 1)):
-        t = np.round(np.arctan2(sv * V, U) / (2 * np.pi) * std.car_n).astype(np.int64) % std.car_n
+        t = np.round((np.arctan2(sv * V, U) + np.radians(lag)) / (2 * np.pi) * std.car_n).astype(np.int64) % std.car_n
         ent[:, 2 + j] = t * std.car_inv % std.car_n
     assert ent[:, 1].max() < 1 << 15
     return ent
@@ -511,7 +604,12 @@ def model(tb, n_frames=None):
             elif row != 0xFFFF:
                 df = f % tb['Yq'].shape[0]
                 y = tb['Yq'][df, row, a] + BLANK
-                c = (tb['Uq'][df, row, a] * S[a] + tb['Vq'][df, row, a] * C[a] + (1 << (CAR_Q - 1))) >> CAR_Q
+                # each block's carrier offset (DAC correction), as fubk_synth20.c
+                d = np.repeat([uv_ofs(tb['uvpool'][u]) for u in tb['uvmap'][df * tb['std'].rows + row]], B)
+                ia = np.arange(std.a0, std.a0 + std.na)
+                Sa = tb['car'][(ms + d) % std.car_n + ia]
+                Ca = tb['car'][(mc + d) % std.car_n + ia]
+                c = (tb['Uq'][df, row, a] * Sa + tb['Vq'][df, row, a] * Ca + (1 << (CAR_Q - 1))) >> CAR_Q
                 line[a] = y + line[a] - BLANK + c if info & 0x40 else y + c
                 if 'text' in tb:
                     text_overlay(line, tb, row, TEXT_STATE['texts'], TEXT_STATE['font'], TEXT_STATE['lut'])
@@ -748,7 +846,7 @@ def write_header(path, tb, what):
         f.write('// delta: block | Y block << POS_BITS | UV block << (POS_BITS + Y_BITS)\n')
         c_array(f, 'uint32_t', f'{p}_delta', tb['delta'], 8)
         c_array(f, 'uint8_t', f'{p}_ypool', tb['ypool'], 32)
-        c_array(f, 'int8_t', f'{p}_uvpool', tb['uvpool'], 32)
+        c_array(f, 'int8_t', f'{p}_uvpool', tb['uvpool'], 32, attr='FUBK_TABLE_ATTR __attribute__((aligned(4)))')
         f.write('// flat[UV block]: 0, or 1 + its chroma waveform in wtab (index n + ms)\n')
         if len(tb['wtab']):
             c_array(f, 'uint8_t', f'{p}_flat', tb['flat'], 32)
@@ -786,7 +884,7 @@ def write_patterns_header(path, items):
             c_array(f, 'uint16_t', f'{q}_row_start', tb['row_start'], attr=A)
             c_array(f, 'uint32_t', f'{q}_delta', tb['delta'], 8, attr=A)
             c_array(f, 'uint8_t', f'{q}_ypool', tb['ypool'], 32, attr=A)
-            c_array(f, 'int8_t', f'{q}_uvpool', tb['uvpool'], 32, attr=A)
+            c_array(f, 'int8_t', f'{q}_uvpool', tb['uvpool'], 32, attr=A + ' __attribute__((aligned(4)))')
             if len(tb['wtab']):
                 c_array(f, 'uint8_t', f'{q}_flat', tb['flat'], 32, attr=A)
                 c_array(f, 'int8_t', f'{q}_wtab', tb['wtab'], 32, attr=A)
@@ -912,7 +1010,8 @@ def main():
                     pic.append(a)
             else:
                 pic = fn(std)
-                tb = build(std, *pic, flat=kind != 'noflat')
+                tb = build(PAL_LOCK if kind == 'lock' and std is PAL else std, *pic,
+                           flat=kind not in ('noflat', 'lock'))   # lock: 36 colours, 76 KB of flat waveforms
                 if name == 'PM5644':                # both text lines in its two boxes
                     tb['text'] = pm5644_text_boxes(std, pic[0])
                 if kind == 'noburst':               # same timing, burst off on every line

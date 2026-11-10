@@ -196,6 +196,36 @@ def multiburst(std):
     return c.yuv()
 
 
+PHASE_AMPS = (50.0, 100.0, 150.0, 200.0, 250.0, 300.0, 350.0, 400.0, 450.0)   # chroma peak per band (mV)
+PHASE_LUMA = (0.0, 100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0)   # luma steps (mV above blanking)
+
+
+def phase_test(std):
+    """DAC phase / gain map: 9 horizontal bands, chroma 50, 100 .. 450 mV peak (top to bottom;
+    the burst is 150; 100 % red and cyan reach 442), each with 8 luma steps 0, 100 .. 700 mV
+    above blanking. Where luma + chroma would leave the range of real colour signals (above
+    933 mV or below -233 mV) the step has no chroma. The chroma points the burst's way without
+    the V part (-U, 180 deg), so it continues the burst's sine wave: on a scope every step should
+    be in phase with it (minus the burst rotation), and on a TV every step of a band should be
+    the same colour."""
+    c = Canvas(std)
+    Y = np.zeros((c.H, std.spl))
+    U = np.zeros((c.H, std.spl))
+    nb, ns = len(PHASE_AMPS), len(PHASE_LUMA)
+    for b, amp in enumerate(PHASE_AMPS):
+        for i, y in enumerate(PHASE_LUMA):
+            cov = c.rect(i * c.W / ns, (i + 1) * c.W / ns, c.H * b / nb, c.H * (b + 1) / nb)
+            Y += cov * y
+            if y + amp <= 933 and y - amp >= -233:
+                U += cov * -amp
+    area = mt.pe._step(c.t, c.t0, 150e-9) - mt.pe._step(c.t, c.t1, 150e-9)
+    Y = gaussian_filter1d(Y, LUMA_SIGMA, axis=-1, mode='nearest') * area
+    U = gaussian_filter1d(U, CHROMA_SIGMA, axis=-1, mode='nearest') * area
+    V = np.zeros_like(U)
+    _blank_half_lines(std, c.t, Y, U, V)
+    return tuple(a[None] for a in (Y, U, V))
+
+
 def overscan(std):
     """White outline at the picture edge, 5 % (action safe, 75 % grey) and 10 % (title safe,
     50 % grey) outlines, and a centre cross."""
@@ -327,6 +357,8 @@ PATTERNS = [
     ('window', window, ''),
     ('multiburst, no burst', multiburst, 'noburst'),
     ('non-interlaced picture', image_256, 'image'),
+    # For measuring the DAC (make_tables20.DAC_LAG): add ('phase test', phase_test, 'lock') here
+    # and set FUBK20_NPAT in fubk_synth20.h to 18.
 ]
 # The pattern button's order per standard; None = the standard's own test card (FuBK / SMPTE
 # bars, tables always in RAM, made in make_tables20.py). PAL starts on FuBK, NTSC on PM5644.

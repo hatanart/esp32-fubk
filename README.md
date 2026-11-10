@@ -30,15 +30,17 @@ generator; it is set with the two buttons.
 
 The ESP32's internal 8-bit DAC sends samples at 20 MS/s. The colour subcarrier is calculated
 for every sample, so the subcarrier frequency is exact and the 8-field PAL sequence (with the
-25 Hz offset) is standard. The 20 MHz clock comes from the audio PLL with integer settings only,
-so it has none of the sigma-delta clock jitter that makes slowly moving patterns on most ESP32
-composite projects.
+25 Hz offset) is standard. The 20 MHz clock is an exact division of the CPU's
+main PLL, so it has none of the sigma-delta clock jitter of the audio PLL that makes slowly
+moving patterns on most ESP32 composite projects.
 
 Tested on a Panasonic CRT, a 20-year-old plasma TV, a cheap reverse-camera monitor, a
-RetroScaler 2X and a modern OLED TV's AV input. The ESP32's DAC shifts the colour of the picture
-about 9° against the colour burst. The burst is turned back by the same amount (found by eye on
-these screens). Without that, the anti-PAL boxes were not grey and the RetroScaler and the OLED
-showed moving Hanover bars (horizontal colour stripes) on saturated colours.
+RetroScaler 2X and a modern OLED TV's AV input. The ESP32's DAC delays the colour of the picture
+against the colour burst, by 0 to 20° depending on brightness and colour strength, and weakens it
+near white. This was measured with an oscilloscope (72 points), and the pattern tables undo it
+colour block by colour block, so the colour is right within about 1°. Without a correction the
+anti-PAL boxes were not grey and the RetroScaler and the OLED showed moving Hanover bars
+(horizontal colour stripes) on saturated colours.
 
 ## Hardware
 
@@ -443,10 +445,14 @@ main differences:
 - **Anti-PAL boxes:** these are correct. The two data frames from the PT8631 alternate, so the
   boxes show grey on a PAL-D (delay-line) TV and colour on a simple PAL-S decoder.
 - **Timing:** standard 625/50: 64.000 µs lines, 4.7 µs sync, 10-cycle burst at 135° / 225°, and
-  exact fsc 4 433 618.75 Hz. In the samples the burst sits 9.1° early (126° / 216°): the ESP32
-  DAC delays the picture's colour by about that much, so on the screen they match again. Burst
-  amplitude is within 1 % and phase within 1° of nominal (8-bit rounding included). The SC-H
-  phase (subcarrier to sync timing) is not set to a defined value.
+  exact fsc 4 433 618.75 Hz. Burst amplitude is within 1 % and phase within 1° of nominal
+  (8-bit rounding included). The SC-H phase (subcarrier to sync timing) is not set to a defined
+  value.
+- **DAC correction (both standards):** in the samples the picture colour is turned ahead of
+  where it belongs, and made stronger near white, by what the ESP32 DAC takes away (see
+  [How it works](#how-it-works-short)). Measured at the 75 Ω load it is within about 1° and 2 %
+  of nominal; the brightest strong colours (luma + chroma near 900 mV) keep up to 2°. Other
+  boards may differ a little. With a buffer amplifier after the DAC, build without it (below).
 - **Edges:** sync rise time is 250 ns (the standard allows 200 ± 100 ns).
 
 ### PM5644
@@ -483,8 +489,11 @@ main differences:
 
 ## How it works (short)
 
-- **Clock:** the APLL runs at 80 MHz (integer settings, so no jitter). I2S0 in DAC mode sends
-  80 / 4 = 20 MS/s to DAC1.
+- **Clock:** I2S0 in DAC mode sends 20 MS/s to DAC1, clocked from the CPU's main PLL. Up to
+  v1.4 the clock came from the APLL (80 MHz, integer settings, so no jitter), but its timing
+  against the chip's bus was random at each start, and some cold starts showed snow: the DAC
+  missed updates. From the main PLL the timing is the same on every start.
+  `idf.py -DFUBK_CLK_APLL=1 build` builds the old clock.
 - **Picture tables:** each line is built from 32-sample blocks of Y and U/V. A table only lists
   the blocks that change from one line to the next, so the whole FuBK card fits in 113 KB of
   internal RAM. No PSRAM is needed.
@@ -503,6 +512,17 @@ main differences:
   so each palette colour stores its brightness, its saturation A and its hue as an offset into
   the sine table. Each sample is then one table read and one multiply. 4 pixels make 13 samples
   (3.25 per pixel). The picture is copied to RAM when selected (PAL 90 KB, in small blocks).
+- **DAC correction:** the ESP32 DAC drives the 110 Ω + 75 Ω load directly. Near the top of its
+  range and with large swings its output gets slower and weaker, so the colour lags behind the
+  burst (0° at blanking, about 9° for typical saturated colours, 20° on white) and loses up to
+  25 % near white. The lag and loss were measured with a scope on a 9 × 8 map of luma and chroma
+  levels (`DAC_LAG` / `DAC_GAIN` in `make_tables20.py`). When the tables are made, each sample's
+  chroma is raised by the loss (within the DAC's range), and each 32-sample colour block gets a
+  carrier offset that advances it by the lag: the synth reads its sine table there, which turns
+  the colour on +V and −V lines alike. It costs 2 bytes per colour block and almost no CPU.
+  To build without it (for example with a video buffer after the DAC), make the tables with
+  `FUBK_DAC_CORR=0 ../venv/bin/python tools/make_tables20.py`: that brings back the older
+  fixed 9.1° burst rotation.
 - **Teletext and captions:** the data lines are drawn sample by sample into blank lines
   (`vbi20.c`). Teletext bits are 320/111 samples long, so each sample is looked up from its
   position in the bit and the 5 nearest bits (raised-cosine pulses, no energy above 5.2 MHz). The

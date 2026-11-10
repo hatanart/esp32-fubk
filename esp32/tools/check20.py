@@ -77,17 +77,24 @@ else:
     a1 = np.array([x for x, _ in ang])
     print(f'       phase {a1.min():.2f} .. {a1.max():.2f} deg (want 180)')
 
-# chroma vs source (same demod filter applied to the quantised source values)
+# chroma vs source (same demod filter applied to the quantised source values). With the DAC
+# correction each block's chroma is turned ahead by its carrier offset (make_tables20.build): in
+# the decoded U, V (V switched back) that is +theta on +V lines and -theta on -V lines.
 act = slice(std.a0 + 24, std.a0 + std.na - 24)
 worst = 0
+blk_theta = np.array([(mt.uv_ofs(b) * std.car_step % std.car_n) * 2 * np.pi / std.car_n for b in tb['uvpool']])
 for f in range(nf):
     df = f % std.data_frames
     for l in range(1, L + 1):
         r = tb['rowmap'][l - 1]
         if r == 0xFFFF or tb['line_info'][l - 1] & 0x40:
             continue
-        ur = gaussian_filter1d(tb['Uq'][df, r] * mt.LSB_MV, SIG)
-        vr = gaussian_filter1d(tb['Vq'][df, r] * mt.LSB_MV, SIG)
+        th = np.zeros(SPL)
+        th[std.a0:std.a0 + std.na] = np.repeat(blk_theta[tb['uvmap'][df * std.rows + r]], mt.B)
+        sg = -1.0 if std.vswitch and (f * L + l - 1) & 1 else 1.0
+        u0, v0 = tb['Uq'][df, r] * mt.LSB_MV, tb['Vq'][df, r] * mt.LSB_MV
+        ur = gaussian_filter1d(u0 * np.cos(th) - sg * v0 * np.sin(th), SIG)
+        vr = gaussian_filter1d(v0 * np.cos(th) + sg * u0 * np.sin(th), SIG)
         # luma near fsc (gratings, edges) leaks into the demodulated chroma: compare only where
         # the source luma is smooth
         yr = tb['Yq'][df, r] * mt.LSB_MV
@@ -118,6 +125,10 @@ if a.ntsc:
         x = p0
         y_lp = gaussian_filter1d(mv[0, l - 1], 8.0)
         for w, (yv, uv, vv) in segs:
+            if mt.DAC_CORR and np.hypot(uv, vv) > 0:   # expected with the DAC correction
+                lag, gain = (float(np.ravel(z)[0]) for z in mt.dac_correction(std, np.array([yv]), np.array([np.hypot(uv, vv)])))
+                t_ = np.radians(lag)
+                uv, vv = (uv * np.cos(t_) - vv * np.sin(t_)) / gain, (vv * np.cos(t_) + uv * np.sin(t_)) / gain
             tc = x + w * wbar / 2
             c = col(tc * 1e6)
             dy, du, dv = y_lp[c], Ud[0, l - 1, c], Vd[0, l - 1, c]
