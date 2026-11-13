@@ -104,6 +104,9 @@ static volatile uint32_t last_di;                  // descriptor index at the pr
 static volatile uint32_t next_buf[2];
 static volatile uint32_t n_irq, n_lines, n_missed[2], n_qfull, cyc_max[2], cyc_sum[2], cyc_n[2];
 static volatile uint32_t n_rempty, n_hung, n_dscr_err;
+// lines the DMA still had to send before reaching a buffer when its refill ended (least per log
+// period), and refills that ended with the DMA already in that buffer (late: picture damaged)
+static volatile uint32_t margin_min[2] = { ~0u, ~0u }, n_late[2];
 
 // --- tone: phase in 1/20000 cycle (1 kHz x one sample period = 1/20000 cycle) ----------------
 static DRAM_ATTR int8_t sin256[256];
@@ -173,6 +176,16 @@ static IRAM_ATTR void timed_fill(uint32_t k)
     uint32_t t0 = esp_cpu_get_cycle_count();
     fill(k);
     uint32_t dt = esp_cpu_get_cycle_count() - t0;
+    uint32_t cur = (uint32_t)((lldesc_t *)I2S0.out_link_dscr - desc);    // descriptor being sent
+    if (cur < 2 * NBUF) {
+        uint32_t m = (2 * k + 2 * NBUF - cur) % (2 * NBUF);
+        if (m >= 2 * NBUF - 1)                      // in buffer k (its first or second line)
+            m = 0;
+        if (m == 0)
+            n_late[w]++;
+        if (m < margin_min[w])
+            margin_min[w] = m;
+    }
     if (dt > cyc_max[w])
         cyc_max[w] = dt;
     cyc_sum[w] += dt;
@@ -569,6 +582,18 @@ static void button_task(void *arg)
     for (int i = 0; i < FUBK_START_PATTERN; i++)
         next_pattern();
 #endif
+#ifdef FUBK_SOAK_MIN
+    // soak test: the next pattern every FUBK_SOAK_MIN minutes; after the last one, the other
+    // standard (restart), so it runs through both until stopped. The buttons do nothing.
+    ESP_LOGI(TAG, "SOAK %s pattern %lu", cur ? "NTSC" : "PAL", (unsigned long)cur_pat);
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(FUBK_SOAK_MIN * 60000u));
+        if (cur_pat == FUBK20_NPAT - 1)
+            save_std_and_restart(!cur);
+        next_pattern();
+        ESP_LOGI(TAG, "SOAK %s pattern %lu", cur ? "NTSC" : "PAL", (unsigned long)cur_pat);
+    }
+#endif
     // each button acts when it is released (50 ms down, then 50 ms up: debounced), and only if
     // the other one was not pressed meanwhile: both together do nothing in normal use (the edit
     // mode is only entered by holding both at power-on)
@@ -813,8 +838,10 @@ void app_main(void)
         double rate = (double)(lines_now - lines_last) * avg_len / ((t_now - t_last) * 1e-6);
         t_last = t_now;
         lines_last = lines_now;
-        uint32_t mx[2], n[2], sum[2];
+        uint32_t mx[2], n[2], sum[2], mg[2];
         for (int w = 0; w < 2; w++) {
+            mg[w] = margin_min[w];
+            margin_min[w] = ~0u;
             mx[w] = cyc_max[w];
             n[w] = cyc_n[w];
             sum[w] = cyc_sum[w];
@@ -827,8 +854,10 @@ void app_main(void)
                  S->name, (unsigned long)re, (unsigned long)hu, (unsigned long)de,
                  (unsigned long)n_missed[0], (unsigned long)n_missed[1], (unsigned long)n_qfull, rate);
         for (int w = 0; w < 2; w++)
-            ESP_LOGI(TAG, "core %d: render 2 lines avg %lu max %lu cycles = %.0f%% / %.0f%% of its time",
+            ESP_LOGI(TAG, "core %d: render 2 lines avg %lu max %lu cycles = %.0f%% / %.0f%% of its time; "
+                     "DMA margin min %ld lines, late %lu",
                      w == 0 ? 0 : 1, (unsigned long)(n[w] ? sum[w] / n[w] : 0), (unsigned long)mx[w],
-                     n[w] ? 100.0 * sum[w] / n[w] / budget : 0.0, 100.0 * mx[w] / budget);
+                     n[w] ? 100.0 * sum[w] / n[w] / budget : 0.0, 100.0 * mx[w] / budget,
+                     mg[w] == ~0u ? -1L : (long)mg[w], (unsigned long)n_late[w]);
     }
 }

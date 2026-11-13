@@ -357,7 +357,8 @@ PATTERNS = [
     ('window', window, ''),
     ('multiburst, no burst', multiburst, 'noburst'),
     ('non-interlaced picture', image_256, 'image'),
-    # For measuring the DAC (make_tables20.DAC_LAG): add ('phase test', phase_test, 'lock') here
+    # For measuring the DAC (make_tables20.DAC_LAG; PAL_LOCK / NTSC_LOCK timing): add
+    # ('phase test', phase_test, 'lock') here
     # and set FUBK20_NPAT in fubk_synth20.h to 18.
 ]
 # The pattern button's order per standard; None = the standard's own test card (FuBK / SMPTE

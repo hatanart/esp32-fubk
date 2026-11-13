@@ -451,8 +451,9 @@ main differences:
 - **DAC correction (both standards):** in the samples the picture colour is turned ahead of
   where it belongs, and made stronger near white, by what the ESP32 DAC takes away (see
   [How it works](#how-it-works-short)). Measured at the 75 Ω load it is within about 1° and 2 %
-  of nominal; the brightest strong colours (luma + chroma near 900 mV) keep up to 2°. Other
-  boards may differ a little. With a buffer amplifier after the DAC, build without it (below).
+  of nominal; the brightest strong colours (luma + chroma near 900 mV) keep up to 2°. NTSC uses
+  the PAL measurement scaled to its subcarrier frequency, and the scope confirms it there too
+  (within 2°). Other boards may differ a little. With a buffer amplifier after the DAC, build without it (below).
 - **Edges:** sync rise time is 250 ns (the standard allows 200 ± 100 ns).
 
 ### PM5644

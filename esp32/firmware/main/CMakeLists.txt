@@ -72,6 +72,12 @@ set(FUBK_START_PATTERN 0 CACHE STRING "pattern to step to at start (test builds)
 if(FUBK_START_PATTERN)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE FUBK_START_PATTERN=${FUBK_START_PATTERN})
 endif()
+# Soak test: the next pattern every n minutes, then the other standard (restart), forever; the
+# log shows each pattern's render time and DMA margin.   idf.py -DFUBK_SOAK_MIN=15 build   (=0 = off)
+set(FUBK_SOAK_MIN 0 CACHE STRING "soak test: minutes per pattern, 0 = off")
+if(FUBK_SOAK_MIN)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE FUBK_SOAK_MIN=${FUBK_SOAK_MIN})
+endif()
 # Old clock (up to v1.4): I2S from the integer APLL (80 MHz) instead of PLL_D2 (160 MHz, the CPU's
 # PLL). The APLL's phase against the bus is random at each start; some cold starts gave snow.
 #   idf.py -DFUBK_CLK_APLL=1 build   (remembered; =0 switches back)

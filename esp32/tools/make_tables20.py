@@ -204,6 +204,11 @@ assert (262 * NTSC.spl - 10) * NTSC.ph_num % NTSC.ph_den == 0
 PAL_LOCK = replace(PAL, ext_every=8, ext_n=75, ph_reset=True)
 _c = ((625 * PAL.spl + 150) * PAL.ph_num % PAL.ph_den) / PAL.ph_den
 assert min(_c, 1 - _c) < 0.003, _c
+# NTSC the same way: 525 x 1271 samples = 119427.61 cycles; lines 40, 80, .. 440 are 2 samples
+# longer (+22 samples: 1.0 deg left over) and the phase restarts at every frame
+NTSC_LOCK = replace(NTSC, ext_every=40, ext_n=11, ph_reset=True)
+_c = ((525 * NTSC.spl + 22) * NTSC.ph_num % NTSC.ph_den) / NTSC.ph_den
+assert min(_c, 1 - _c) < 0.003, _c
 IMG_W = 320                       # image pixels per line: 4 pixels = 13 samples (3.25 each)
 IMG_MAP13 = [0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3]   # pixel (of 4) of each of 13 samples
 
@@ -1010,7 +1015,7 @@ def main():
                     pic.append(a)
             else:
                 pic = fn(std)
-                tb = build(PAL_LOCK if kind == 'lock' and std is PAL else std, *pic,
+                tb = build((PAL_LOCK if std is PAL else NTSC_LOCK) if kind == 'lock' else std, *pic,
                            flat=kind not in ('noflat', 'lock'))   # lock: 36 colours, 76 KB of flat waveforms
                 if name == 'PM5644':                # both text lines in its two boxes
                     tb['text'] = pm5644_text_boxes(std, pic[0])
