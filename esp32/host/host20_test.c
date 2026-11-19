@@ -86,6 +86,7 @@ int main(int argc, char **argv)
     for (int w = 0; w < 2; w++) {
         st[w].vbi_on = argc > 6 && atoi(argv[6]);
         st[w].frame = argc > 7 ? (uint32_t)strtoul(argv[7], 0, 0) : 0;
+        st[w].fields = 2 * st[w].frame;              // the data clocks: 2 fields per frame
     }
     if (split) {                                      // as main20.c: state 1 starts at buffer 1
         fubk20_skip(&st[1]);

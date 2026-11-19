@@ -183,6 +183,7 @@ void fubk20_init(fubk20_state_t *st, const fubk20_std_t *s)
     st->s = s;
     st->line = 1;
     st->frame = 0;
+    st->fields = 0;
     st->acc = 0;
     st->vs = 0;
     st->g = 0;
@@ -224,6 +225,7 @@ static inline void advance(fubk20_state_t *st)
     if (++st->line > s->lines) {
         st->line = 1;
         st->frame++;
+        st->fields += s->lines < 400 ? 1u : 2u;          // 288p / 240p: a "frame" is one field
         if (st->pend && st->frame == st->pend_frame) {   // pattern switch: the first rows of a
             st->s = st->pend;                            // field list all blocks, so the block
             st->pend = 0;                                // list needs no reset
@@ -428,9 +430,19 @@ FUBK_HOT void fubk20_line(fubk20_state_t *st, fubk_sample_t *buf, uint32_t off)
     }
     copy_tmpl(buf, off, t, n_end, spl);
 
+    uint32_t vl = l;                     // the line number the data lines see
+#ifdef FUBK_TTX_LINE
+    // test build: PAL teletext on line FUBK_TTX_LINE (and + 313) instead of 20 / 333, even inside
+    // the picture (that line then shows the data instead of the picture)
+    if (s->vbi == VBI20_TTX) {
+        vl = l == FUBK_TTX_LINE ? 20u : l == FUBK_TTX_LINE + 313u ? 333u : (l == 20 || l == 333) ? 0u : l;
+        if (vl == 20 || vl == 333)
+            row = 0xFFFF;
+    }
+#endif
     if (row == 0xFFFF) {
         // no picture: blanking, or a data line (teletext / captions; drawn on blanking)
-        if (st->vbi_on && s->vbi && vbi20_line(s->vbi, l, st->frame, st->vbi_buf, a0, n_end))
+        if (st->vbi_on && s->vbi && vbi20_line(s->vbi, vl, st->fields, st->vbi_buf, a0, n_end))
             copy_tmpl(buf, off, st->vbi_buf, a0, n_end);
         else
             copy_tmpl(buf, off, t, a0, n_end);

@@ -908,7 +908,7 @@ def write_patterns_header(path, items):
                 lines, rows = f'{P}_LINES', f'{P}_ROWS'
             short = f'{ts.short_line}, {ts.short_by}, {ts.ext_every}, {ts.ext_n}, {int(ts.ph_reset)}'
             text = f'{q}_text, {len(tb["text"])}' if 'text' in tb else '0, 0'
-            vbi = '0' if ts.prog else f'{P}_VBI'
+            vbi = '0' if ts.prog and std is NTSC else f'{P}_VBI'   # 240p: no captions (field 1 only)
             if 'img' in tb:
                 f.write(f'// image: {ts.rows} rows x {IMG_W} palette indices; palette (y, a, carrier offsets +V / -V)\n')
                 c_array(f, 'uint8_t', f'{q}_img', tb['img'], 32, attr=A)

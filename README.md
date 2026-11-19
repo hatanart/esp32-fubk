@@ -192,7 +192,8 @@ All lines are white or grey, never thin coloured lines: composite colour only ha
 of bandwidth, so thin red or blue lines smear. Horizontal lines are 2 picture lines thick (one in
 each field), so they don't flicker on interlaced TVs. The list order is fixed: new patterns are
 added at the end, so a number keeps its meaning (v1.3 inserted the second test card at 1, so
-the older extra patterns moved up by one). Teletext and captions are off on pattern 16.
+the older extra patterns moved up by one). On pattern 16, PAL keeps its teletext (line 20 of
+every field) and NTSC has no captions.
 
 ### Your own text on the test cards
 

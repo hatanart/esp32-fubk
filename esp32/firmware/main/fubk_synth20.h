@@ -89,6 +89,8 @@ typedef struct {
     const fubk20_std_t *s;
     uint32_t line;                       // 1..lines, the next line
     uint32_t frame;                      // counts frames (data frame = frame % data_frames)
+    uint32_t fields;                     // fields since start, for the data lines' clocks: +2 per
+                                         // interlaced frame, +1 per 288p / 240p field (= frame)
     uint32_t acc;                        // subcarrier phase numerator at the next line's sample 0
     uint32_t vs;                         // PAL V-switch of the next line
     uint32_t g;                          // line counter mod 2 * long_period (line lengths)

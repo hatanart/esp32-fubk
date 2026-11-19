@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check the data lines of the 20 MS/s output with an independent decoder.
 
-usage: check_vbi20.py pal|ntsc <with data .u8> <without data .u8> <first frame>
+usage: check_vbi20.py pal|ntsc|pal288 <with data .u8> <without data .u8> <first frame>
 
 1. All other lines must be identical to the output without data lines.
 2. Teletext (PAL): the line is low-passed (5 MHz, as a TV's data slicer sees it), the bit
@@ -222,8 +222,57 @@ def check_cc(on, first):
             fail(f'caption "{text}" on row {row}, expected "{exp}" on row 15')
 
 
+def fields_288p(path):
+    """The PAL 288p page's output split into fields of 313 lines, padded to 1282 samples (some
+    lines are 2 samples longer, make_tables20.PAL_PROG)."""
+    import make_tables20 as mt
+    d = np.fromfile(path, np.uint8)
+    lens = [mt.line_len(mt.PAL_PROG, 0, l) for l in range(1, 314)]
+    n = d.size // sum(lens)
+    assert n * sum(lens) == d.size, 'not whole fields'
+    out = np.zeros((n, 313, 1282), np.uint8)
+    pos = 0
+    for f in range(n):
+        for l, ln in enumerate(lens):
+            out[f, l, :ln] = d[pos:pos + ln]
+            pos += ln
+    return out
+
+
+def check_ttx_288p(on, first):
+    """288p: one packet on line 20 of every field; field count = 2 * first + field index (the
+    host test starts the counter at 2 fields per frame), clock = fields / 50."""
+    page = open(os.path.join(here, '..', '..', 'data', 'TEST25'), 'rb').read()[:1000]
+    expect = mv.packets(page)
+    clocks = []
+    for fi in range(on.shape[0]):
+        f = 2 * first + fi
+        r = ttx_decode(on[fi, 19, :1280])
+        if r is None:
+            fail(f'field {f}: no framing code on line 20')
+        by = r[0]
+        n = f % 25
+        exp = list(expect[n])
+        if n == 0:
+            s = f // 50
+            clk = '%02d:%02d:%02d' % (s // 3600 % 24, s // 60 % 60, s % 60)
+            exp[mv.TTX_CLOCK_OFS:mv.TTX_CLOCK_OFS + 8] = [mv.par(ord(c)) for c in clk]
+            clocks.append(clk)
+        if by != exp:
+            fail(f'field {f}: packet {n} bytes differ')
+    print(f'  {on.shape[0]} fields, a packet on line 20 of each, all bytes as sent; header clocks '
+          f'{clocks[0]} .. {clocks[-1]} (one second per 50 fields)')
+
+
 def main():
     std, f_on, f_off, first = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+    if std == 'pal288':
+        on, off = fields_288p(f_on), fields_288p(f_off)
+        print(f'PAL 288p data lines, fields {2 * first}..{2 * first + on.shape[0] - 1}:')
+        compare_other(on, off, (20,))
+        check_ttx_288p(on, first)
+        print('  OK')
+        return
     spl, lines = (1280, 625) if std == 'pal' else (1271, 525)
     on, off = lines_of(f_on, spl, lines), lines_of(f_off, spl, lines)
     print(f'{std.upper()} data lines, frames {first}..{first + on.shape[0] - 1}:')

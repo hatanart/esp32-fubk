@@ -105,8 +105,11 @@ Default build = 20 MHz standard PAL (`FUBK_20MHZ=1`, the others off):
   count every line kept its PAL V-switch sign in every field, and the small remaining DAC phase
   error stood still as Hanover bars on the picture's sky; odd, it flips per field as in 625i), NTSC 262 lines (1-3 and
   7-9 equalising, 4-6 broad, picture 22..261). To the synth a field is a frame, so the frame
-  counter counts fields there; the V-switch runs on unchanged. Teletext / captions
-  are off (`vbi = 0`); the teletext clock runs twice as fast while the page is shown.
+  counter counts fields there; the V-switch runs on unchanged. The data lines use their own
+  field counter (`st->fields`: +2 per interlaced frame, +1 per 288p / 240p field), so their
+  clocks keep time on every page. PAL 288p: teletext on line 20 of every field (one packet per
+  field, as in 576i; a TV decodes it). NTSC 240p: no captions (`vbi = 0`), since they belong in
+  field 1 only and every 240p field is alike.
 - Image rendering: palette entry `{y, a, k[2]}`, sample = `(y + a * car[(ms + k[vs]) % N + i]) >> 20`
   (`a` = A << 6, `k` = hue offset `t * car_inv mod N` for +V / -V lines; the hue is rounded to
   360/N degrees: PAL 0.35, NTSC 1.0). 8 pixels = 26 samples = 13 pairs per loop step, written
@@ -246,8 +249,12 @@ Default build = 20 MHz standard PAL (`FUBK_20MHZ=1`, the others off):
   checks framing, Hamming, parity, every byte, the header clock and the caption text (a small
   EIA-608 pop-on decoder), and checks that all other lines are byte-identical. Teletext eye:
   111 of 144 ns wide, worst bit 183 mV from the threshold. Clock rollover 00:59:59 → 01:00:00 is
-  tested in both standards.
-- **Hardware:** teletext page 100 shows on a real TV. Captions not yet tried on a TV.
+  tested in both standards and on the PAL 288p page.
+- **Hardware:** teletext page 100 shows on a real TV, also on the 288p page (clock ticking).
+  Captions not yet tried on a TV.
+- Test option `FUBK_TTX_LINE=n`: teletext on line n and n + 313 instead of 20 / 333. With 167
+  (mid-picture) the data shows as a noise line in every pattern and the TV says teletext is not
+  available: its decoder only reads the blanking lines.
 
 ## Front panel and NTSC (20 MHz build)
 
@@ -263,7 +270,13 @@ NTSC: SMPTE EG-1 colour bars (75 % bars, castellations, -I / white / +Q, PLUGE 3
 IRE) across the full active line (9.4 .. 62.05 us after 0H), 7.5 IRE setup, 525 lines interlaced.
 Every line is 1271 samples (63.55 us, 227.48 fsc cycles; the exact 227.5 would be 11440/9
 samples). Mixing 1271- and 1272-sample lines to get exactly 227.5 on average (`long_period = 9` in
-make_tables20.py) was tried: vertical edges got wavy and a plasma TV showed snow, so it is off. Exact fsc
+make_tables20.py) was tried: vertical edges got wavy and a plasma TV showed snow, so it is off.
+A clock that gives whole lines does not work either (tried 2026-11-14): the APLL at 90 MHz
+(integer settings) gives 22.5 MS/s, exactly 1430 samples per NTSC line, and the log measured
+22.50 MS/s, but on the scope the DAC output carries a fixed pattern at 2.5 MHz = 22.5 - 20 MHz
+(sidebands at 2.5 k MHz +- fsc, the strongest 11 dB below the carrier; samples held twice as
+long at regular intervals). The DAC evidently stays tied to the chip's 20 MHz timing, so only
+20 MS/s (and its relatives) are clean, and the 1271-sample line stays. Exact fsc
 3 579 545.45 Hz (63/352 of the sample rate: the carrier table is exact). Burst 40 IRE p-p at
 180 deg. Flat-colour blocks use precomputed chroma (no multiplies). Tables 22 KB.
 `tools/check20.py --ntsc out/model20_ntsc_2frames.u8` checks every bar against EG-1 (worst 3.3 mV).

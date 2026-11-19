@@ -27,14 +27,14 @@ static VBI_HOT uint8_t odd_parity(uint32_t c)
 #define TTX_I0 (TTX_S0 - 6)              // from 2 bits before the first bit ...
 #define TTX_I1 (TTX_S0 + 1044)           // ... to 2.5 bits after the last (360 bits)
 
-static VBI_HOT void ttx_render(uint32_t field, uint32_t frame, uint8_t *out)
+static VBI_HOT void ttx_render(uint32_t fld, uint8_t *out)     // fld: this field's number
 {
     uint8_t pk[47];                      // the packet, 2 zero bytes for the bits after the end
-    uint32_t n = ((frame % TTX_PACKETS) * 2 + field) % TTX_PACKETS;
+    uint32_t n = fld % TTX_PACKETS;
     memcpy(pk, ttx_page[n], 45);
     pk[45] = pk[46] = 0;
     if (n == 0) {                        // header: clock hh:mm:ss since power-on
-        uint32_t s = frame / 25, h = (s / 3600) % 24, m = (s / 60) % 60;
+        uint32_t s = fld / 50, h = (s / 3600) % 24, m = (s / 60) % 60;
         s %= 60;
         uint8_t *c = pk + TTX_CLOCK_OFS;
         c[0] = odd_parity('0' + h / 10); c[1] = odd_parity('0' + h % 10);
@@ -135,20 +135,20 @@ static VBI_HOT void cc_render(uint32_t frame, uint8_t *out)
     }
 }
 
-VBI_HOT int vbi20_line(uint32_t kind, uint32_t line, uint32_t frame, uint8_t *out, uint32_t n0, uint32_t n1)
+VBI_HOT int vbi20_line(uint32_t kind, uint32_t line, uint32_t fields, uint8_t *out, uint32_t n0, uint32_t n1)
 {
     if (kind == VBI20_TTX && (line == VBI20_TTX_LINE1 || line == VBI20_TTX_LINE2)) {
         if (n0 > TTX_I0 || n1 < TTX_I1)
             return 0;
         memset(out + n0, BLANK, n1 - n0);
-        ttx_render(line == VBI20_TTX_LINE2, frame, out);
+        ttx_render(fields + (line == VBI20_TTX_LINE2), out);
         return 1;
     }
     if (kind == VBI20_CC && line == VBI20_CC_LINE) {
         if (n0 > CC_R || n1 < CC_I1)
             return 0;
         memset(out + n0, BLANK, n1 - n0);
-        cc_render(frame, out);
+        cc_render(fields / 2, out);
         return 1;
     }
     return 0;

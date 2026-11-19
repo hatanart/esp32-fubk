@@ -78,6 +78,12 @@ set(FUBK_SOAK_MIN 0 CACHE STRING "soak test: minutes per pattern, 0 = off")
 if(FUBK_SOAK_MIN)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE FUBK_SOAK_MIN=${FUBK_SOAK_MIN})
 endif()
+# Test: PAL teletext on line n (and n + 313) instead of 20 / 333, e.g. 167 = mid-picture, to see
+# whether a TV decodes it there.   idf.py -DFUBK_TTX_LINE=167 build   (remembered; =0 = off)
+set(FUBK_TTX_LINE 0 CACHE STRING "test: teletext line (0 = normal 20 / 333)")
+if(FUBK_TTX_LINE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE FUBK_TTX_LINE=${FUBK_TTX_LINE})
+endif()
 # Old clock (up to v1.4): I2S from the integer APLL (80 MHz) instead of PLL_D2 (160 MHz, the CPU's
 # PLL). The APLL's phase against the bus is random at each start; some cold starts gave snow.
 #   idf.py -DFUBK_CLK_APLL=1 build   (remembered; =0 switches back)

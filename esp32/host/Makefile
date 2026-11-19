@@ -99,6 +99,8 @@ testvbi: host20_i2s16
 	$(PY) ../tools/check_vbi20.py ntsc ../out/v_ntsc_on.u8 ../out/v_ntsc_off.u8 0
 	./host20_i2s16 ../out/v_ntsc_on.u8 70 1 1 0 1 107850 && ./host20_i2s16 ../out/v_ntsc_off.u8 70 1 1 0 0 107850
 	$(PY) ../tools/check_vbi20.py ntsc ../out/v_ntsc_on.u8 ../out/v_ntsc_off.u8 107850
+	./host20_i2s16 ../out/v_p16_on.u8 110 1 0 16 1 89975 && ./host20_i2s16 ../out/v_p16_off.u8 110 1 0 16 0 89975
+	$(PY) ../tools/check_vbi20.py pal288 ../out/v_p16_on.u8 ../out/v_p16_off.u8 89975
 	rm -f ../out/v_*.u8
 
 clean20:

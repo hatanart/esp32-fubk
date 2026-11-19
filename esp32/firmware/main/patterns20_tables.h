@@ -16980,7 +16980,7 @@ static const fubk20_pal_t FUBK_PAT_ATTR n20p16_pal[256] = {
     PAT(f20, F20, "PAL overscan / safe areas", 6, 5, f20p13_ypool, f20p13_row_start, f20p13_delta, f20p13_uvpool, 0, 0, F20_LINES, F20_ROWS, f20_line_info, f20_rowmap, F20_VBI, 0, 0, 0, 0, 0, 0, 0, 0, 0), \
     PAT(f20, F20, "PAL window", 6, 2, f20p14_ypool, f20p14_row_start, f20p14_delta, f20p14_uvpool, 0, 0, F20_LINES, F20_ROWS, f20_line_info, f20_rowmap, F20_VBI, 0, 0, 0, 0, 0, 0, 0, 0, 0), \
     PAT(f20, F20, "PAL multiburst, no burst", 6, 6, f20p15_ypool, f20p15_row_start, f20p15_delta, f20p15_uvpool, 0, 0, 625, 576, f20p15_line_info, f20p15_rowmap, F20_VBI, 0, 0, 0, 0, 0, 0, 0, 0, 0), \
-    PAT(f20, F20, "PAL non-interlaced picture", 6, 1, f20p16_ypool, f20p16_row_start, f20p16_delta, f20p16_uvpool, 0, 0, 313, 288, f20p16_line_info, f20p16_rowmap, 0, f20p16_img_rows, f20p16_pal, 0, 0, 14, 22, 1, 0, 0)
+    PAT(f20, F20, "PAL non-interlaced picture", 6, 1, f20p16_ypool, f20p16_row_start, f20p16_delta, f20p16_uvpool, 0, 0, 313, 288, f20p16_line_info, f20p16_rowmap, F20_VBI, f20p16_img_rows, f20p16_pal, 0, 0, 14, 22, 1, 0, 0)
 #define F20_PATTERNS_MAIN 0   // its position
 // bytes of row_start, delta, ypool, uvpool, flat, wtab, line_info, rowmap, img_pal
 // (copied to RAM with the pattern; the image rows are copied by the firmware)
